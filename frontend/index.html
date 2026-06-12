@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Nexus: Unbound</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #02000a; color: #e0e0e0; font-family: 'Courier New', monospace; overflow: hidden; }
+
+  #canvas-container { position: absolute; inset: 0; z-index: 1; }
+
+  /* Overlay de scanlines */
+  #canvas-container::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px);
+    pointer-events: none; z-index: 2;
+  }
+
+  #ui-root {
+    position: absolute; inset: 0; z-index: 10;
+    display: flex; flex-direction: column;
+    pointer-events: none;
+  }
+
+  /* HUD top */
+  #hud-top {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 16px 20px; pointer-events: none;
+  }
+
+  .hud-panel {
+    background: rgba(0,0,0,0.75);
+    border: 1px solid var(--cor, #00ffcc);
+    border-radius: 6px; padding: 10px 14px;
+    min-width: 180px;
+    box-shadow: 0 0 12px var(--cor, #00ffcc44);
+  }
+
+  .hud-panel h3 { font-size: 11px; letter-spacing: 2px; opacity: 0.7; margin-bottom: 6px; text-transform: uppercase; }
+  .hud-panel .nome { font-size: 14px; font-weight: bold; color: var(--cor, #00ffcc); margin-bottom: 8px; }
+
+  .barra-wrap { margin-bottom: 5px; }
+  .barra-label { font-size: 10px; opacity: 0.6; margin-bottom: 2px; display: flex; justify-content: space-between; }
+  .barra { height: 8px; background: #1a1a1a; border-radius: 4px; overflow: hidden; }
+  .barra-fill { height: 100%; border-radius: 4px; transition: width 0.4s ease; }
+  .barra-vida .barra-fill { background: linear-gradient(90deg, #ff4444, #ff8800); }
+  .barra-mana .barra-fill { background: linear-gradient(90deg, #4466ff, #aa44ff); }
+
+  #hud-hidden { display: none; }
+
+  /* Painel central de log */
+  #log-wrap {
+    flex: 1;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 0 20px 10px;
+    pointer-events: none;
+  }
+
+  #log-box {
+    background: rgba(0,0,0,0.7);
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 10px 14px;
+    max-height: 160px;
+    overflow-y: auto;
+    font-size: 12px;
+    line-height: 1.6;
+    display: none;
+  }
+
+  #log-box p { margin-bottom: 2px; }
+  #log-box p.sys { color: #888; }
+  #log-box p.acao { color: #00ffcc; }
+  #log-box p.inimigo { color: #ff6655; }
+  #log-box p.vitoria { color: #ffdd00; font-weight: bold; }
+  #log-box p.derrota { color: #ff3333; font-weight: bold; }
+
+  /* Painel inferior */
+  #bottom-panel {
+    padding: 12px 20px 18px;
+    display: flex; flex-direction: column; gap: 10px;
+    pointer-events: all;
+  }
+
+  /* Input inicial */
+  #input-wrap {
+    display: flex; gap: 8px;
+    background: rgba(0,0,0,0.8);
+    border: 2px solid #00ffcc;
+    border-radius: 8px;
+    padding: 10px 14px;
+    box-shadow: 0 0 20px #00ffcc33, inset 0 0 20px #00ffcc08;
+  }
+
+  #input-wrap input {
+    flex: 1; background: transparent; border: none; outline: none;
+    color: #fff; font-family: inherit; font-size: 14px;
+  }
+
+  #input-wrap input::placeholder { color: #555; }
+
+  #btn-criar {
+    background: linear-gradient(135deg, #00ffcc, #0088aa);
+    border: none; border-radius: 6px;
+    padding: 10px 20px; font-weight: bold;
+    font-family: inherit; font-size: 13px;
+    cursor: pointer; letter-spacing: 1px;
+    transition: all 0.2s; color: #000;
+  }
+
+  #btn-criar:hover { filter: brightness(1.2); transform: scale(1.03); }
+  #btn-criar:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  /* Botões de ação de batalha */
+  #acoes-wrap {
+    display: none; gap: 8px; flex-wrap: wrap;
+  }
+
+  .btn-acao {
+    background: rgba(0,0,0,0.8);
+    border: 1px solid var(--cor, #00ffcc);
+    color: var(--cor, #00ffcc);
+    border-radius: 6px; padding: 9px 14px;
+    font-family: inherit; font-size: 12px;
+    cursor: pointer; transition: all 0.2s;
+    box-shadow: 0 0 8px var(--cor, #00ffcc22);
+  }
+
+  .btn-acao:hover { background: var(--cor, #00ffcc); color: #000; }
+  .btn-acao:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* Status de conexão */
+  #status-conn {
+    position: absolute; top: 10px; right: 20px;
+    font-size: 10px; letter-spacing: 1px; opacity: 0.6;
+    z-index: 20; pointer-events: none;
+  }
+
+  /* Partículas de título */
+  #titulo {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -60%);
+    text-align: center; z-index: 5; pointer-events: none;
+    transition: opacity 1s ease;
+  }
+
+  #titulo h1 {
+    font-size: clamp(28px, 5vw, 60px);
+    letter-spacing: 8px; font-weight: 900; text-transform: uppercase;
+    background: linear-gradient(135deg, #00ffcc, #aa44ff, #ff8800);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+    filter: drop-shadow(0 0 20px #00ffcc88);
+  }
+
+  #titulo p { font-size: 12px; letter-spacing: 3px; opacity: 0.5; margin-top: 8px; }
+
+  #titulo.oculto { opacity: 0; }
+
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #00ffcc44; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<div id="status-conn">● DESCONECTADO</div>
+<div id="titulo">
+  <h1>Nexus: Unbound</h1>
+  <p>Motor de Entretenimento Infinito</p>
+</div>
+
+<div id="ui-root">
+  <div id="hud-top">
+    <div class="hud-panel" id="hud-heroi" style="display:none">
+      <h3>Herói</h3>
+      <div class="nome" id="h-classe">—</div>
+      <div class="barra-wrap barra-vida">
+        <div class="barra-label"><span>VIDA</span><span id="h-vida-val">—</span></div>
+        <div class="barra"><div class="barra-fill" id="h-vida-bar" style="width:100%"></div></div>
+      </div>
+      <div class="barra-wrap barra-mana">
+        <div class="barra-label"><span>MANA</span><span id="h-mana-val">—</span></div>
+        <div class="barra"><div class="barra-fill" id="h-mana-bar" style="width:100%"></div></div>
+      </div>
+    </div>
+    <div id="hud-hidden"></div>
+    <div class="hud-panel" id="hud-inimigo" style="display:none; --cor:#ff6655">
+      <h3>Inimigo</h3>
+      <div class="nome" id="i-nome">—</div>
+      <div class="barra-wrap barra-vida">
+        <div class="barra-label"><span>VIDA</span><span id="i-vida-val">—</span></div>
+        <div class="barra"><div class="barra-fill" id="i-vida-bar" style="width:100%; background:linear-gradient(90deg,#ff3333,#ff6600)"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="log-wrap">
+    <div id="log-box"></div>
+  </div>
+
+  <div id="bottom-panel">
+    <div id="acoes-wrap"></div>
+    <div id="input-wrap">
+      <input type="text" id="prompt-input" placeholder="Descreva seu universo... ex: RPG cyberpunk com magia medieval" />
+      <button id="btn-criar" onclick="gerarMundo()">⚡ CRIAR</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ===================== CONEXÃO WEBSOCKET =====================
+// ===================== CONFIGURAÇÃO DE CONEXÃO REFEITA =====================
+const API_KEY = 'dev-key-abc123';
+let estadoJogo = null;
+let cor = 0x00ffcc;
+let batalhaEncerrada = false;
+
+// Linha de conexão corrigida manualmente e sem erros de aspas:
+const ws = new WebSocket("wss://stunning-computing-machine-r4rpq9jr9j653p6p5-8000.app.github.dev/v1/nexus/stream");
+
+const statusEl = document.getElementById('status-conn');
+
+function conectar() {
+  ws = new WebSocket(getWsUrl());
+
+  ws.onopen = () => {
+    statusEl.textContent = '● CONECTADO';
+    statusEl.style.color = '#00ffcc';
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = '● RECONECTANDO...';
+    statusEl.style.color = '#ff8800';
+    setTimeout(conectar, 2000);
+  };
+
+  ws.onerror = () => {
+    statusEl.textContent = '● ERRO DE CONEXÃO';
+    statusEl.style.color = '#ff4444';
+  };
+
+  ws.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    processarMensagem(data);
+  };
+}
+
+conectar();
+
+// ===================== THREE.JS SCENE =====================
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+container.appendChild(renderer.domElement);
+
+camera.position.set(0, 12, 30);
+camera.lookAt(0, 0, 0);
+
+// Iluminação
+const ambLight = new THREE.AmbientLight(0x111122, 1.5);
+scene.add(ambLight);
+const dirLight = new THREE.DirectionalLight(0x00ffcc, 2);
+dirLight.position.set(10, 20, 10);
+scene.add(dirLight);
+const pointLight = new THREE.PointLight(0x00ffcc, 3, 60);
+pointLight.position.set(0, 8, 0);
+scene.add(pointLight);
+
+// Grid
+const grid = new THREE.GridHelper(200, 60, 0x00ffcc, 0x112222);
+scene.add(grid);
+
+// Partículas de fundo
+const partGeo = new THREE.BufferGeometry();
+const partCount = 400;
+const positions = new Float32Array(partCount * 3);
+for (let i = 0; i < partCount * 3; i++) positions[i] = (Math.random() - 0.5) * 300;
+partGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+const partMat = new THREE.PointsMaterial({ color: 0x00ffcc, size: 0.4, transparent: true, opacity: 0.5 });
+const particles = new THREE.Points(partGeo, partMat);
+scene.add(particles);
+
+// Estruturas procedurais
+let estruturas = [];
+
+function limparEstruturas() {
+  estruturas.forEach(e => scene.remove(e));
+  estruturas = [];
+}
+
+function gerarEstruturas(corHex, tipo) {
+  limparEstruturas();
+  const corObj = new THREE.Color(corHex);
+  const mat = new THREE.MeshStandardMaterial({
+    color: corObj, emissive: corObj, emissiveIntensity: 0.4,
+    transparent: true, opacity: 0.85, wireframe: tipo === 'arcane_void'
+  });
+
+  const count = tipo === 'medieval_castle' ? 12 : 16;
+  for (let i = 0; i < count; i++) {
+    const h = 4 + Math.random() * 18;
+    let geo;
+    if (tipo === 'medieval_castle') {
+      geo = new THREE.CylinderGeometry(0.8, 1.2, h, 6);
+    } else if (tipo === 'arcane_void') {
+      geo = new THREE.OctahedronGeometry(1.5 + Math.random() * 2);
+    } else {
+      geo = new THREE.BoxGeometry(1.5 + Math.random(), h, 1.5 + Math.random());
+    }
+    const mesh = new THREE.Mesh(geo, mat.clone());
+    const angle = (i / count) * Math.PI * 2;
+    const radius = 10 + Math.random() * 12;
+    mesh.position.set(Math.cos(angle) * radius, h / 2, Math.sin(angle) * radius);
+    mesh.userData.vel = (Math.random() - 0.5) * 0.005;
+    scene.add(mesh);
+    estruturas.push(mesh);
+  }
+
+  // Luz colorida no centro
+  pointLight.color.set(corHex);
+  dirLight.color.set(corHex);
+  grid.material[0].color.set(corHex);
+  partMat.color.set(corHex);
+}
+
+// Animação
+let t = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  t += 0.008;
+  camera.position.x = Math.sin(t * 0.2) * 5;
+  camera.position.z = 28 + Math.sin(t * 0.15) * 4;
+  camera.lookAt(0, 2, 0);
+  particles.rotation.y += 0.0003;
+  estruturas.forEach(e => {
+    e.rotation.y += e.userData.vel;
+    e.position.y += Math.sin(t + e.rotation.y) * 0.005;
+  });
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ===================== LÓGICA DO JOGO =====================
+function gerarMundo() {
+  const input = document.getElementById('prompt-input').value.trim();
+  if (!input) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    logMsg('⚠️ Sem conexão com o servidor.', 'sys'); return;
+  }
+  document.getElementById('btn-criar').disabled = true;
+  document.getElementById('titulo').classList.add('oculto');
+  ws.send(JSON.stringify({ api_key: API_KEY, prompt: input }));
+}
+
+document.getElementById('prompt-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') gerarMundo();
+});
+
+function enviarAcao(acao) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !estadoJogo || batalhaEncerrada) return;
+  setBotoesAtivos(false);
+  ws.send(JSON.stringify({ api_key: API_KEY, acao, estado: estadoJogo }));
+}
+
+function processarMensagem(data) {
+  if (data.status === 'MOLDANDO_UNIVERSO') {
+    logBox(true);
+    logMsg('⚙️ ' + data.message, 'sys');
+    return;
+  }
+
+  if (data.status === 'UNIVERSO_PRONTO') {
+    estadoJogo = data;
+    cor = data.cor_tema;
+    batalhaEncerrada = false;
+    gerarEstruturas(cor, data.skybox);
+    atualizarHUD(data.heroi, data.inimigo);
+    renderizarBotoes(data.habilidades);
+    data.log.forEach(l => logMsg(l, 'acao'));
+    setBotoesAtivos(true);
+    document.getElementById('btn-criar').disabled = false;
+    document.getElementById('input-wrap').style.opacity = '0.5';
+    return;
+  }
+
+  if (data.status === 'ESTADO_ATUALIZADO') {
+    const e = data.estado;
+    estadoJogo = e;
+    atualizarHUD(e.heroi, e.inimigo);
+    e.log.forEach(l => {
+      const cls = l.includes('👹') ? 'inimigo' : l.includes('VITÓRIA') ? 'vitoria' : l.includes('DERROTA') ? 'derrota' : 'acao';
+      logMsg(l, cls);
+    });
+    if (e.batalha_encerrada) {
+      batalhaEncerrada = true;
+      setBotoesAtivos(false);
+      document.getElementById('btn-criar').disabled = false;
+      document.getElementById('input-wrap').style.opacity = '1';
+    } else {
+      setBotoesAtivos(true);
+    }
+    return;
+  }
+
+  if (data.status === 'ERRO_PAYLOAD' || data.status === 'RATE_LIMITED') {
+    logMsg('⚠️ ' + data.message, 'sys');
+    document.getElementById('btn-criar').disabled = false;
+  }
+}
+
+function atualizarHUD(heroi, inimigo) {
+  document.getElementById('hud-heroi').style.display = 'block';
+  document.getElementById('hud-inimigo').style.display = 'block';
+  document.getElementById('h-classe').textContent = heroi.classe;
+  document.getElementById('h-vida-val').textContent = `${heroi.vida}/${heroi.vida_max}`;
+  document.getElementById('h-vida-bar').style.width = `${Math.max(0, heroi.vida / heroi.vida_max * 100)}%`;
+  document.getElementById('h-mana-val').textContent = `${heroi.mana}/${heroi.mana_max}`;
+  document.getElementById('h-mana-bar').style.width = `${Math.max(0, heroi.mana / heroi.mana_max * 100)}%`;
+  document.getElementById('i-nome').textContent = inimigo.nome;
+  document.getElementById('i-vida-val').textContent = `${inimigo.vida}/${inimigo.vida_max}`;
+  document.getElementById('i-vida-bar').style.width = `${Math.max(0, inimigo.vida / inimigo.vida_max * 100)}%`;
+}
+
+function renderizarBotoes(habilidades) {
+  const wrap = document.getElementById('acoes-wrap');
+  wrap.innerHTML = '';
+  wrap.style.display = 'flex';
+  const corCSS = `#${cor.toString(16).padStart(6, '0')}`;
+
+  const btnAtk = document.createElement('button');
+  btnAtk.className = 'btn-acao';
+  btnAtk.style = `--cor:${corCSS}`;
+  btnAtk.textContent = '⚔️ ATACAR';
+  btnAtk.onclick = () => enviarAcao('ATACAR');
+  wrap.appendChild(btnAtk);
+
+  habilidades.forEach((hab, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn-acao';
+    btn.style = `--cor:${corCSS}`;
+    btn.textContent = `✨ ${hab.nome} (${hab.custo_mana} MP)`;
+    btn.title = hab.descricao;
+    btn.onclick = () => enviarAcao(`HABILIDADE_${i}`);
+    wrap.appendChild(btn);
+  });
+}
+
+function setBotoesAtivos(ativo) {
+  document.querySelectorAll('.btn-acao').forEach(b => b.disabled = !ativo);
+}
+
+const logBoxEl = document.getElementById('log-box');
+
+function logBox(show) {
+  logBoxEl.style.display = show ? 'block' : 'none';
+}
+
+function logMsg(texto, tipo) {
+  logBox(true);
+  const p = document.createElement('p');
+  p.className = tipo || '';
+  p.textContent = texto;
+  logBoxEl.appendChild(p);
+  logBoxEl.scrollTop = logBoxEl.scrollHeight;
+}
+</script>
+</body>
+</html>
