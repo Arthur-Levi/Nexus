@@ -47,7 +47,20 @@
   .barra-vida .barra-fill { background: linear-gradient(90deg, #ff4444, #ff8800); }
   .barra-mana .barra-fill { background: linear-gradient(90deg, #4466ff, #aa44ff); }
 
-  #hud-hidden { display: none; }
+  /* Badge de gênero (Gene Classifier) */
+  #genero-badge {
+    align-self: center;
+    background: rgba(0,0,0,0.78);
+    border: 1px solid var(--cor, #00ffcc);
+    border-radius: 20px;
+    padding: 6px 16px;
+    font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--cor, #00ffcc);
+    box-shadow: 0 0 12px var(--cor, #00ffcc44);
+    white-space: nowrap;
+    display: none;
+  }
+  #genero-badge .conf { opacity: 0.55; margin-left: 8px; font-size: 10px; }
 
   /* Painel central de log */
   #log-wrap {
@@ -186,9 +199,9 @@
         <div class="barra"><div class="barra-fill" id="h-mana-bar" style="width:100%"></div></div>
       </div>
     </div>
-    <div id="hud-hidden"></div>
+    <div id="genero-badge"></div>
     <div class="hud-panel" id="hud-inimigo" style="display:none; --cor:#ff6655">
-      <h3>Inimigo</h3>
+      <h3 id="i-titulo">Inimigo</h3>
       <div class="nome" id="i-nome">—</div>
       <div class="barra-wrap barra-vida">
         <div class="barra-label"><span>VIDA</span><span id="i-vida-val">—</span></div>
@@ -213,14 +226,18 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 // ===================== CONEXÃO WEBSOCKET =====================
-// ===================== CONFIGURAÇÃO DE CONEXÃO REFEITA =====================
 const API_KEY = 'dev-key-abc123';
 let estadoJogo = null;
 let cor = 0x00ffcc;
 let batalhaEncerrada = false;
+let ws = null;
+let criarTimeout = null;  // watchdog: evita travar em "Gerando..." se o servidor não responder
 
-// Linha de conexão corrigida manualmente e sem erros de aspas:
-const ws = new WebSocket("wss://stunning-computing-machine-r4rpq9jr9j653p6p5-8000.app.github.dev/v1/nexus/stream");
+// Deriva a URL do próprio host: funciona local, em Codespaces e em produção.
+function getWsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${location.host}/v1/nexus/stream`;
+}
 
 const statusEl = document.getElementById('status-conn');
 
@@ -244,8 +261,11 @@ function conectar() {
   };
 
   ws.onmessage = (evt) => {
-    const data = JSON.parse(evt.data);
-    processarMensagem(data);
+    try {
+      processarMensagem(JSON.parse(evt.data));
+    } catch (e) {
+      console.error('Mensagem inválida do servidor:', e);
+    }
   };
 }
 
@@ -289,15 +309,42 @@ scene.add(particles);
 
 // Estruturas procedurais
 let estruturas = [];
+let chao = null;       // plano de chão (criado uma vez, recolorido por tema)
+let entidade = null;   // inimigo/criatura central do mundo
 
 function limparEstruturas() {
   estruturas.forEach(e => scene.remove(e));
   estruturas = [];
 }
 
+// Tom escuro derivado da cor do tema (para fundo / névoa / chão)
+function corEscura(corHex, f) {
+  const c = new THREE.Color(corHex);
+  c.multiplyScalar(f);
+  return c;
+}
+
 function gerarEstruturas(corHex, tipo) {
   limparEstruturas();
   const corObj = new THREE.Color(corHex);
+
+  // Atmosfera: fundo escuro do tema + névoa exponencial (dá profundidade)
+  const fundo = corEscura(corHex, 0.05);
+  scene.background = fundo;
+  scene.fog = new THREE.FogExp2(fundo.getHex(), 0.016);
+
+  // Chão do cenário (criado uma vez, só recolorido depois)
+  if (!chao) {
+    chao = new THREE.Mesh(
+      new THREE.PlaneGeometry(600, 600),
+      new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0.05 })
+    );
+    chao.rotation.x = -Math.PI / 2;
+    chao.position.y = -0.5;
+    scene.add(chao);
+  }
+  chao.material.color = corEscura(corHex, 0.16);
+
   const mat = new THREE.MeshStandardMaterial({
     color: corObj, emissive: corObj, emissiveIntensity: 0.4,
     transparent: true, opacity: 0.85, wireframe: tipo === 'arcane_void'
@@ -316,7 +363,7 @@ function gerarEstruturas(corHex, tipo) {
     }
     const mesh = new THREE.Mesh(geo, mat.clone());
     const angle = (i / count) * Math.PI * 2;
-    const radius = 10 + Math.random() * 12;
+    const radius = 14 + Math.random() * 12;
     mesh.position.set(Math.cos(angle) * radius, h / 2, Math.sin(angle) * radius);
     mesh.userData.vel = (Math.random() - 0.5) * 0.005;
     scene.add(mesh);
@@ -326,8 +373,30 @@ function gerarEstruturas(corHex, tipo) {
   // Luz colorida no centro
   pointLight.color.set(corHex);
   dirLight.color.set(corHex);
-  grid.material[0].color.set(corHex);
+  // GridHelper no r128 tem UM material (não array): trate os dois casos.
+  const gridMat = Array.isArray(grid.material) ? grid.material[0] : grid.material;
+  if (gridMat && gridMat.color) gridMat.color.set(corHex);
   partMat.color.set(corHex);
+}
+
+// Inimigo/criatura central — o "sujeito" visível do mundo gerado
+function renderizarEntidade(corHex, modo) {
+  if (entidade) {
+    scene.remove(entidade);
+    entidade.geometry.dispose();
+    entidade.material.dispose();
+    entidade = null;
+  }
+  const corObj = new THREE.Color(corHex);
+  // criatura (captura) = forma orgânica; inimigo (batalha) = forma angular
+  const geo = modo === 'captura'
+    ? new THREE.IcosahedronGeometry(3.2, 0)
+    : new THREE.DodecahedronGeometry(3.2, 0);
+  entidade = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    color: corObj, emissive: corObj, emissiveIntensity: 0.7, flatShading: true
+  }));
+  entidade.position.set(0, 4, 0);
+  scene.add(entidade);
 }
 
 // Animação
@@ -343,6 +412,11 @@ function animate() {
     e.rotation.y += e.userData.vel;
     e.position.y += Math.sin(t + e.rotation.y) * 0.005;
   });
+  if (entidade) {
+    entidade.rotation.y += 0.01;
+    entidade.rotation.x = Math.sin(t * 0.5) * 0.15;
+    entidade.position.y = 4 + Math.sin(t * 1.5) * 0.4;
+  }
   renderer.render(scene, camera);
 }
 animate();
@@ -363,6 +437,12 @@ function gerarMundo() {
   document.getElementById('btn-criar').disabled = true;
   document.getElementById('titulo').classList.add('oculto');
   ws.send(JSON.stringify({ api_key: API_KEY, prompt: input }));
+
+  clearTimeout(criarTimeout);
+  criarTimeout = setTimeout(() => {
+    logMsg('⚠️ O servidor não respondeu a tempo. Verifique a conexão e tente de novo.', 'sys');
+    document.getElementById('btn-criar').disabled = false;
+  }, 8000);
 }
 
 document.getElementById('prompt-input').addEventListener('keydown', e => {
@@ -383,12 +463,22 @@ function processarMensagem(data) {
   }
 
   if (data.status === 'UNIVERSO_PRONTO') {
+    clearTimeout(criarTimeout);
     estadoJogo = data;
     cor = data.cor_tema;
     batalhaEncerrada = false;
-    gerarEstruturas(cor, data.skybox);
+    // A cena 3D é "best-effort": se algo falhar, o jogo (HUD + ações) continua jogável.
+    try {
+      gerarEstruturas(cor, data.skybox);
+      renderizarEntidade(cor, data.modo);
+    } catch (err) {
+      console.error('Falha ao renderizar a cena 3D:', err);
+    }
+    mostrarGenero(data.genero);
+    document.getElementById('i-titulo').textContent =
+      data.modo === 'captura' ? 'Criatura Selvagem' : 'Inimigo';
     atualizarHUD(data.heroi, data.inimigo);
-    renderizarBotoes(data.habilidades);
+    renderizarBotoes(data.habilidades, data.modo);
     data.log.forEach(l => logMsg(l, 'acao'));
     setBotoesAtivos(true);
     document.getElementById('btn-criar').disabled = false;
@@ -401,7 +491,11 @@ function processarMensagem(data) {
     estadoJogo = e;
     atualizarHUD(e.heroi, e.inimigo);
     e.log.forEach(l => {
-      const cls = l.includes('👹') ? 'inimigo' : l.includes('VITÓRIA') ? 'vitoria' : l.includes('DERROTA') ? 'derrota' : 'acao';
+      const cls = l.includes('👹') ? 'inimigo'
+        : (l.includes('VITÓRIA') || l.includes('🎯')) ? 'vitoria'
+        : l.includes('DERROTA') ? 'derrota'
+        : (l.includes('💨') || l.includes('❌')) ? 'sys'
+        : 'acao';
       logMsg(l, cls);
     });
     if (e.batalha_encerrada) {
@@ -434,7 +528,17 @@ function atualizarHUD(heroi, inimigo) {
   document.getElementById('i-vida-bar').style.width = `${Math.max(0, inimigo.vida / inimigo.vida_max * 100)}%`;
 }
 
-function renderizarBotoes(habilidades) {
+function mostrarGenero(genero) {
+  if (!genero) return;
+  const el = document.getElementById('genero-badge');
+  const corCSS = `#${cor.toString(16).padStart(6, '0')}`;
+  el.style.setProperty('--cor', corCSS);
+  const conf = Math.round((genero.confianca || 0) * 100);
+  el.innerHTML = `🧬 ${genero.nome}<span class="conf">${conf}% match</span>`;
+  el.style.display = 'block';
+}
+
+function renderizarBotoes(habilidades, modo) {
   const wrap = document.getElementById('acoes-wrap');
   wrap.innerHTML = '';
   wrap.style.display = 'flex';
@@ -456,6 +560,17 @@ function renderizarBotoes(habilidades) {
     btn.onclick = () => enviarAcao(`HABILIDADE_${i}`);
     wrap.appendChild(btn);
   });
+
+  // O modo "captura" (Gene Classifier -> creature_collector) habilita capturar.
+  if (modo === 'captura') {
+    const btnCap = document.createElement('button');
+    btnCap.className = 'btn-acao';
+    btnCap.style = `--cor:${corCSS}`;
+    btnCap.textContent = '🎯 CAPTURAR';
+    btnCap.title = 'Maior chance quanto mais fraca estiver a criatura';
+    btnCap.onclick = () => enviarAcao('CAPTURAR');
+    wrap.appendChild(btnCap);
+  }
 }
 
 function setBotoesAtivos(ativo) {

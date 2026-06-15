@@ -1,13 +1,23 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
+import os
 import asyncio
 import json
 import time
 import random
+import re
+import unicodedata
 import hashlib
 from collections import defaultdict
 
 app = FastAPI(title="Nexus: Unbound - Core Server")
+
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
+
+@app.get("/")
+async def index():
+    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
 
 # --- Config ---
 API_KEYS = {"dev-key-abc123", "prod-key-xyz789"}
@@ -114,11 +124,91 @@ def detectar_tema(prompt: str) -> dict:
     tema_final["habilidades"] = (tema_final["habilidades"] + extras_hab)[:4]
     return tema_final
 
+# --- Gene Classifier: classifica o gênero do jogo por vetor de palavras-chave ---
+# Cada gênero é um "gene" = conjunto de tokens ponderados. A classificação é o
+# produto escalar entre o saco-de-palavras do prompt e os pesos de cada gênero,
+# normalizado para virar uma confiança. Puro: sem assets, sem modelo externo.
+
+GENEROS = {
+    "creature_collector": {
+        "nome": "Colecionador de Criaturas",
+        "modo": "captura",
+        "genes": {
+            "criatura": 3, "criaturas": 3, "monstro": 3, "monstros": 3, "bicho": 2,
+            "capturar": 3, "captura": 3, "coletar": 3, "colecionar": 3, "colecao": 2,
+            "pokemon": 4, "treinador": 3, "domar": 2, "evoluir": 2, "fera": 2, "besta": 2,
+        },
+    },
+    "space_combat": {
+        "nome": "Combate Espacial",
+        "modo": "batalha",
+        "genes": {
+            "espaco": 3, "espacial": 3, "nave": 3, "naves": 3, "alien": 3, "alienigena": 3,
+            "galaxia": 3, "estrela": 2, "planeta": 2, "laser": 2, "foguete": 2, "astronauta": 3,
+            "cosmos": 2, "orbita": 2, "asteroide": 2, "robo": 2, "ficcao": 2,
+        },
+    },
+    "dungeon_crawler": {
+        "nome": "Explorador de Masmorras",
+        "modo": "batalha",
+        "genes": {
+            "masmorra": 3, "masmorras": 3, "dungeon": 3, "caverna": 2, "labirinto": 3,
+            "explorar": 2, "tesouro": 2, "armadilha": 2, "cripta": 2, "ruina": 2, "ruinas": 2,
+        },
+    },
+    "rpg_battle": {
+        "nome": "Batalha RPG",
+        "modo": "batalha",
+        "genes": {
+            "rpg": 3, "batalha": 3, "luta": 3, "heroi": 2, "guerreiro": 2, "espada": 2,
+            "mago": 2, "cavaleiro": 2, "dragao": 2, "aventura": 2, "combate": 2, "magia": 2,
+        },
+    },
+}
+
+DEFAULT_GENERO = "rpg_battle"
+
+def _normalizar(texto: str) -> str:
+    # remove acentos para que os genes ASCII casem com entradas como "espaço" / "herói"
+    nfkd = unicodedata.normalize("NFKD", texto.lower())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+def classificar_genero(prompt: str) -> dict:
+    tokens = re.findall(r"[a-z0-9]+", _normalizar(prompt or ""))
+    contagem: dict[str, int] = {}
+    for tok in tokens:
+        contagem[tok] = contagem.get(tok, 0) + 1
+
+    scores = {}
+    for gid, dados in GENEROS.items():
+        s = 0
+        for gene, peso in dados["genes"].items():
+            if gene in contagem:
+                s += peso * contagem[gene]
+        scores[gid] = s
+
+    total = sum(scores.values())
+    if total <= 0:
+        melhor = DEFAULT_GENERO
+        confianca = 0.0
+    else:
+        melhor = max(scores, key=lambda g: scores[g])
+        confianca = round(scores[melhor] / total, 3)
+
+    return {
+        "genero": melhor,
+        "nome": GENEROS[melhor]["nome"],
+        "modo": GENEROS[melhor]["modo"],
+        "confianca": confianca,
+        "scores": scores,
+    }
+
 def gerar_seed(prompt: str) -> int:
     return int(hashlib.md5(prompt.encode()).hexdigest(), 16) % 10000
 
 def gerar_mundo(prompt: str) -> dict:
     tema = detectar_tema(prompt)
+    genero = classificar_genero(prompt)
     seed = gerar_seed(prompt)
     rng = random.Random(seed)
 
@@ -144,6 +234,15 @@ def gerar_mundo(prompt: str) -> dict:
     }
     inimigo["vida"] = inimigo["vida_max"]
 
+    # O gênero classificado molda o modo de jogo (batalha vs. captura)
+    modo = genero["modo"]
+    if modo == "captura":
+        inimigo["selvagem"] = True
+        inimigo["capturavel"] = True
+        log_inicial = f"🌿 Uma criatura selvagem surgiu: {inimigo['nome']}! Enfraqueça-a e capture-a."
+    else:
+        log_inicial = f"⚔️ {heroi['classe']} encontrou {inimigo['nome']}! A batalha começa!"
+
     return {
         "status": "UNIVERSO_PRONTO",
         "seed": seed,
@@ -154,8 +253,11 @@ def gerar_mundo(prompt: str) -> dict:
         "heroi": heroi,
         "inimigo": inimigo,
         "habilidades": tema["habilidades"],
+        "genero": genero,
+        "modo": modo,
+        "colecao": [],
         "turno": "jogador",
-        "log": [f"⚔️ {heroi['classe']} encontrou {inimigo['nome']}! A batalha começa!"],
+        "log": [log_inicial],
     }
 
 def processar_acao(payload: dict) -> dict:
@@ -199,16 +301,37 @@ def processar_acao(payload: dict) -> dict:
                 else:
                     resultado = f"🛡️ {hab['nome']}: {hab['descricao']} ativado!"
 
+    elif acao == "CAPTURAR":
+        modo = estado.get("modo") or estado.get("genero", {}).get("modo")
+        if modo != "captura" or not inimigo.get("capturavel"):
+            resultado = "❌ Esta criatura não pode ser capturada."
+        else:
+            # chance cresce conforme a criatura é enfraquecida (math puro)
+            vida_frac = inimigo["vida"] / max(1, inimigo.get("vida_max", 1))
+            chance = min(0.95, max(0.05, (1 - vida_frac) * 0.9 + 0.05))
+            if random.random() < chance:
+                inimigo["capturado"] = True
+                colecao = estado.get("colecao", [])
+                colecao.append(inimigo["nome"])
+                estado["colecao"] = colecao
+                resultado = f"🎯 Captura bem-sucedida ({int(chance * 100)}%)! {inimigo['nome']} entrou na sua coleção!"
+            else:
+                resultado = f"💨 A criatura escapou ({int(chance * 100)}% de chance)! Enfraqueça-a mais antes de tentar."
+
     log.append(resultado)
 
-    # Turno do inimigo (se ainda vivo)
-    if inimigo["vida"] > 0 and acao in ["ATACAR"] or acao.startswith("HABILIDADE_"):
+    # Turno do inimigo: contra-ataca em ações ofensivas ou após captura falha
+    acao_ofensiva = acao == "ATACAR" or acao.startswith("HABILIDADE_")
+    captura_falhou = acao == "CAPTURAR" and inimigo.get("capturavel") and not inimigo.get("capturado")
+    if inimigo["vida"] > 0 and not inimigo.get("capturado") and (acao_ofensiva or captura_falhou):
         dano_ini = max(1, inimigo.get("ataque", 15) - heroi.get("defesa", 5) + random.randint(-3, 8))
         heroi["vida"] = max(0, heroi["vida"] - dano_ini)
         log.append(f"👹 {inimigo['nome']} contra-ataca causando {dano_ini} de dano!")
 
     batalha_encerrada = False
-    if inimigo["vida"] <= 0:
+    if inimigo.get("capturado"):
+        batalha_encerrada = True
+    elif inimigo["vida"] <= 0:
         log.append(f"🏆 VITÓRIA! {inimigo['nome']} foi derrotado!")
         batalha_encerrada = True
     elif heroi["vida"] <= 0:
@@ -217,6 +340,7 @@ def processar_acao(payload: dict) -> dict:
 
     estado["heroi"] = heroi
     estado["inimigo"] = inimigo
+    estado["colecao"] = estado.get("colecao", [])
     estado["log"] = log[-8:]
     estado["turno"] = "jogador"
     estado["batalha_encerrada"] = batalha_encerrada
