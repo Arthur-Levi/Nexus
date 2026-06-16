@@ -2,595 +2,612 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Nexus: Unbound</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #02000a; color: #e0e0e0; font-family: 'Courier New', monospace; overflow: hidden; }
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Courier New',monospace;color:#cfe}
+#gl{position:fixed;inset:0;display:block;width:100vw;height:100vh}
 
-  #canvas-container { position: absolute; inset: 0; z-index: 1; }
+#hud{position:fixed;top:12px;left:12px;z-index:10;font-size:11px;line-height:1.6;letter-spacing:1px;background:rgba(0,0,0,.5);padding:10px 14px;border:1px solid rgba(0,255,204,.25);border-radius:6px;backdrop-filter:blur(6px);pointer-events:none}
+#hud b{color:#00ffcc}
+#hud .ok{color:#00ff88}#hud .bad{color:#ff5544}#hud .wait{color:#ffaa00}
 
-  /* Overlay de scanlines */
-  #canvas-container::after {
-    content: '';
-    position: absolute; inset: 0;
-    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px);
-    pointer-events: none; z-index: 2;
-  }
+#stats{position:fixed;top:12px;right:12px;z-index:10;font-size:11px;text-align:right;background:rgba(0,0,0,.5);padding:10px 14px;border:1px solid rgba(0,255,204,.25);border-radius:6px;backdrop-filter:blur(6px);pointer-events:none;line-height:1.6}
+#stats .v{color:#00ffcc;font-weight:bold}
 
-  #ui-root {
-    position: absolute; inset: 0; z-index: 10;
-    display: flex; flex-direction: column;
-    pointer-events: none;
-  }
+#panel{position:fixed;bottom:16px;right:16px;z-index:12;background:rgba(2,2,12,.78);border:1px solid rgba(0,255,204,.35);border-radius:10px;padding:14px 16px;backdrop-filter:blur(12px);box-shadow:0 0 30px rgba(0,255,204,.12);width:236px}
+#panel h3{font-size:11px;letter-spacing:3px;color:#00ffcc;margin-bottom:10px;text-transform:uppercase;opacity:.9}
+#panel label{display:block;font-size:10px;opacity:.6;margin-bottom:5px;letter-spacing:1px}
+#styleSel{width:100%;background:#06060f;border:1px solid rgba(0,255,204,.3);color:#cfe;font-family:inherit;font-size:12px;padding:8px 10px;border-radius:6px;outline:none;cursor:pointer;margin-bottom:12px}
+#styleSel option{background:#06060f}
+#fuseBtn{width:100%;background:linear-gradient(135deg,#00ffcc,#0099bb);border:none;color:#001a18;font-family:inherit;font-weight:bold;font-size:12px;letter-spacing:1.5px;padding:10px;border-radius:6px;cursor:pointer;transition:filter .15s,transform .1s}
+#fuseBtn:hover{filter:brightness(1.15);transform:scale(1.02)}
+#fuseBtn:active{transform:scale(.98)}
+#fuseBtn:disabled{opacity:.4;cursor:wait}
+#styleInfo{font-size:10px;opacity:.5;margin-top:10px;line-height:1.5}
 
-  /* HUD top */
-  #hud-top {
-    display: flex; justify-content: space-between; align-items: flex-start;
-    padding: 16px 20px; pointer-events: none;
-  }
+#inv{position:fixed;bottom:16px;left:12px;z-index:10;font-size:11px;background:rgba(0,0,0,.5);padding:8px 12px;border:1px solid rgba(0,255,204,.2);border-radius:6px;backdrop-filter:blur(6px);pointer-events:none;min-width:130px}
+#inv b{color:#00ffcc}
 
-  .hud-panel {
-    background: rgba(0,0,0,0.75);
-    border: 1px solid var(--cor, #00ffcc);
-    border-radius: 6px; padding: 10px 14px;
-    min-width: 180px;
-    box-shadow: 0 0 12px var(--cor, #00ffcc44);
-  }
+#help{position:fixed;bottom:92px;left:50%;transform:translateX(-50%);z-index:10;font-size:10px;opacity:.4;letter-spacing:2px;pointer-events:none;text-align:center}
 
-  .hud-panel h3 { font-size: 11px; letter-spacing: 2px; opacity: 0.7; margin-bottom: 6px; text-transform: uppercase; }
-  .hud-panel .nome { font-size: 14px; font-weight: bold; color: var(--cor, #00ffcc); margin-bottom: 8px; }
+#xhair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9;width:18px;height:18px;pointer-events:none;opacity:.6}
+#xhair::before,#xhair::after{content:'';position:absolute;background:#00ffcc}
+#xhair::before{width:18px;height:1px;top:8px;left:0}
+#xhair::after{width:1px;height:18px;top:0;left:8px}
 
-  .barra-wrap { margin-bottom: 5px; }
-  .barra-label { font-size: 10px; opacity: 0.6; margin-bottom: 2px; display: flex; justify-content: space-between; }
-  .barra { height: 8px; background: #1a1a1a; border-radius: 4px; overflow: hidden; }
-  .barra-fill { height: 100%; border-radius: 4px; transition: width 0.4s ease; }
-  .barra-vida .barra-fill { background: linear-gradient(90deg, #ff4444, #ff8800); }
-  .barra-mana .barra-fill { background: linear-gradient(90deg, #4466ff, #aa44ff); }
+#flash{position:fixed;inset:0;z-index:8;background:#ff0000;opacity:0;pointer-events:none;transition:opacity .15s}
 
-  /* Badge de gênero (Gene Classifier) */
-  #genero-badge {
-    align-self: center;
-    background: rgba(0,0,0,0.78);
-    border: 1px solid var(--cor, #00ffcc);
-    border-radius: 20px;
-    padding: 6px 16px;
-    font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
-    color: var(--cor, #00ffcc);
-    box-shadow: 0 0 12px var(--cor, #00ffcc44);
-    white-space: nowrap;
-    display: none;
-  }
-  #genero-badge .conf { opacity: 0.55; margin-left: 8px; font-size: 10px; }
-
-  /* Painel central de log */
-  #log-wrap {
-    flex: 1;
-    display: flex; flex-direction: column; justify-content: flex-end;
-    padding: 0 20px 10px;
-    pointer-events: none;
-  }
-
-  #log-box {
-    background: rgba(0,0,0,0.7);
-    border: 1px solid #333;
-    border-radius: 6px;
-    padding: 10px 14px;
-    max-height: 160px;
-    overflow-y: auto;
-    font-size: 12px;
-    line-height: 1.6;
-    display: none;
-  }
-
-  #log-box p { margin-bottom: 2px; }
-  #log-box p.sys { color: #888; }
-  #log-box p.acao { color: #00ffcc; }
-  #log-box p.inimigo { color: #ff6655; }
-  #log-box p.vitoria { color: #ffdd00; font-weight: bold; }
-  #log-box p.derrota { color: #ff3333; font-weight: bold; }
-
-  /* Painel inferior */
-  #bottom-panel {
-    padding: 12px 20px 18px;
-    display: flex; flex-direction: column; gap: 10px;
-    pointer-events: all;
-  }
-
-  /* Input inicial */
-  #input-wrap {
-    display: flex; gap: 8px;
-    background: rgba(0,0,0,0.8);
-    border: 2px solid #00ffcc;
-    border-radius: 8px;
-    padding: 10px 14px;
-    box-shadow: 0 0 20px #00ffcc33, inset 0 0 20px #00ffcc08;
-  }
-
-  #input-wrap input {
-    flex: 1; background: transparent; border: none; outline: none;
-    color: #fff; font-family: inherit; font-size: 14px;
-  }
-
-  #input-wrap input::placeholder { color: #555; }
-
-  #btn-criar {
-    background: linear-gradient(135deg, #00ffcc, #0088aa);
-    border: none; border-radius: 6px;
-    padding: 10px 20px; font-weight: bold;
-    font-family: inherit; font-size: 13px;
-    cursor: pointer; letter-spacing: 1px;
-    transition: all 0.2s; color: #000;
-  }
-
-  #btn-criar:hover { filter: brightness(1.2); transform: scale(1.03); }
-  #btn-criar:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
-
-  /* Botões de ação de batalha */
-  #acoes-wrap {
-    display: none; gap: 8px; flex-wrap: wrap;
-  }
-
-  .btn-acao {
-    background: rgba(0,0,0,0.8);
-    border: 1px solid var(--cor, #00ffcc);
-    color: var(--cor, #00ffcc);
-    border-radius: 6px; padding: 9px 14px;
-    font-family: inherit; font-size: 12px;
-    cursor: pointer; transition: all 0.2s;
-    box-shadow: 0 0 8px var(--cor, #00ffcc22);
-  }
-
-  .btn-acao:hover { background: var(--cor, #00ffcc); color: #000; }
-  .btn-acao:disabled { opacity: 0.3; cursor: not-allowed; }
-
-  /* Status de conexão */
-  #status-conn {
-    position: absolute; top: 10px; right: 20px;
-    font-size: 10px; letter-spacing: 1px; opacity: 0.6;
-    z-index: 20; pointer-events: none;
-  }
-
-  /* Partículas de título */
-  #titulo {
-    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -60%);
-    text-align: center; z-index: 5; pointer-events: none;
-    transition: opacity 1s ease;
-  }
-
-  #titulo h1 {
-    font-size: clamp(28px, 5vw, 60px);
-    letter-spacing: 8px; font-weight: 900; text-transform: uppercase;
-    background: linear-gradient(135deg, #00ffcc, #aa44ff, #ff8800);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    background-clip: text;
-    filter: drop-shadow(0 0 20px #00ffcc88);
-  }
-
-  #titulo p { font-size: 12px; letter-spacing: 3px; opacity: 0.5; margin-top: 8px; }
-
-  #titulo.oculto { opacity: 0; }
-
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #00ffcc44; border-radius: 2px; }
+#toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:14;background:rgba(0,255,204,.92);color:#001a18;padding:10px 22px;border-radius:6px;font-size:13px;font-weight:bold;letter-spacing:1px;opacity:0;pointer-events:none;transition:opacity .3s}
+#toast.show{opacity:1}
 </style>
 </head>
 <body>
+<canvas id="gl"></canvas>
+<div id="flash"></div>
+<div id="xhair"></div>
+<div id="toast"></div>
 
-<div id="canvas-container"></div>
-
-<div id="status-conn">● DESCONECTADO</div>
-<div id="titulo">
-  <h1>Nexus: Unbound</h1>
-  <p>Motor de Entretenimento Infinito</p>
+<div id="hud">
+  <div><b>NEXUS</b> · SDF ENGINE</div>
+  <div>WS: <span id="wsState" class="wait">conectando…</span></div>
+  <div>Pos: <span id="posTxt">0, 0, 0</span></div>
+  <div>Chunk: <span id="chunkTxt">0, 0</span></div>
 </div>
 
-<div id="ui-root">
-  <div id="hud-top">
-    <div class="hud-panel" id="hud-heroi" style="display:none">
-      <h3>Herói</h3>
-      <div class="nome" id="h-classe">—</div>
-      <div class="barra-wrap barra-vida">
-        <div class="barra-label"><span>VIDA</span><span id="h-vida-val">—</span></div>
-        <div class="barra"><div class="barra-fill" id="h-vida-bar" style="width:100%"></div></div>
-      </div>
-      <div class="barra-wrap barra-mana">
-        <div class="barra-label"><span>MANA</span><span id="h-mana-val">—</span></div>
-        <div class="barra"><div class="barra-fill" id="h-mana-bar" style="width:100%"></div></div>
-      </div>
-    </div>
-    <div id="genero-badge"></div>
-    <div class="hud-panel" id="hud-inimigo" style="display:none; --cor:#ff6655">
-      <h3 id="i-titulo">Inimigo</h3>
-      <div class="nome" id="i-nome">—</div>
-      <div class="barra-wrap barra-vida">
-        <div class="barra-label"><span>VIDA</span><span id="i-vida-val">—</span></div>
-        <div class="barra"><div class="barra-fill" id="i-vida-bar" style="width:100%; background:linear-gradient(90deg,#ff3333,#ff6600)"></div></div>
-      </div>
-    </div>
-  </div>
+<div id="stats">
+  <div>FPS <span class="v" id="fps">—</span></div>
+  <div>Mundo <span class="v" id="styleTxt">Fantasia Sombria</span></div>
+  <div>Assets <span class="v">0 MB</span></div>
+</div>
 
-  <div id="log-wrap">
-    <div id="log-box"></div>
-  </div>
+<div id="inv"><b>INVENTÁRIO</b><div id="invList">vazio</div><div style="margin-top:4px">Score: <b id="scoreTxt">0</b></div></div>
 
-  <div id="bottom-panel">
-    <div id="acoes-wrap"></div>
-    <div id="input-wrap">
-      <input type="text" id="prompt-input" placeholder="Descreva seu universo... ex: RPG cyberpunk com magia medieval" />
-      <button id="btn-criar" onclick="gerarMundo()">⚡ CRIAR</button>
-    </div>
-  </div>
+<div id="help">WASD mover · MOUSE olhar · CLICK travar/atirar · ESPAÇO subir · CTRL descer</div>
+
+<div id="panel">
+  <h3>Fusão de Universos</h3>
+  <label>Estética do mundo</label>
+  <select id="styleSel">
+    <option value="0">🜂 Fantasia Sombria</option>
+    <option value="1">⬡ Sci-Fi</option>
+    <option value="2">☢ Pós-Apocalíptico</option>
+  </select>
+  <button id="fuseBtn">⚡ FUNDIR UNIVERSO</button>
+  <div id="styleInfo">Cada mundo tem terreno, atmosfera e estruturas próprias. A costura acontece na GPU em menos de 1 segundo.</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
-// ===================== CONEXÃO WEBSOCKET =====================
-const API_KEY = 'dev-key-abc123';
-let estadoJogo = null;
-let cor = 0x00ffcc;
-let batalhaEncerrada = false;
-let ws = null;
-let criarTimeout = null;  // watchdog: evita travar em "Gerando..." se o servidor não responder
+'use strict';
 
-// Deriva a URL do próprio host: funciona local, em Codespaces e em produção.
-function getWsUrl() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/v1/nexus/stream`;
-}
+/* ════════════════════════════════════════════════════════════
+   NEXUS SDF ENGINE — MVP
+   Render por Ray Marching no fragment shader. Zero assets.
+   ════════════════════════════════════════════════════════════ */
 
-const statusEl = document.getElementById('status-conn');
-
-function conectar() {
-  ws = new WebSocket(getWsUrl());
-
-  ws.onopen = () => {
-    statusEl.textContent = '● CONECTADO';
-    statusEl.style.color = '#00ffcc';
-  };
-
-  ws.onclose = () => {
-    statusEl.textContent = '● RECONECTANDO...';
-    statusEl.style.color = '#ff8800';
-    setTimeout(conectar, 2000);
-  };
-
-  ws.onerror = () => {
-    statusEl.textContent = '● ERRO DE CONEXÃO';
-    statusEl.style.color = '#ff4444';
-  };
-
-  ws.onmessage = (evt) => {
-    try {
-      processarMensagem(JSON.parse(evt.data));
-    } catch (e) {
-      console.error('Mensagem inválida do servidor:', e);
-    }
-  };
-}
-
-conectar();
-
-// ===================== THREE.JS SCENE =====================
-const container = document.getElementById('canvas-container');
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000);
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
-renderer.shadowMap.enabled = true;
-container.appendChild(renderer.domElement);
 
-camera.position.set(0, 12, 30);
-camera.lookAt(0, 0, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const geometry = new THREE.PlaneGeometry(2, 2);
 
-// Iluminação
-const ambLight = new THREE.AmbientLight(0x111122, 1.5);
-scene.add(ambLight);
-const dirLight = new THREE.DirectionalLight(0x00ffcc, 2);
-dirLight.position.set(10, 20, 10);
-scene.add(dirLight);
-const pointLight = new THREE.PointLight(0x00ffcc, 3, 60);
-pointLight.position.set(0, 8, 0);
-scene.add(pointLight);
+const uniforms = {
+  u_time:           { value: 0.0 },
+  u_resolution:     { value: new THREE.Vector2(innerWidth, innerHeight) },
+  u_cameraPosition: { value: new THREE.Vector3(0, 22, 0) },
+  u_cameraDir:      { value: new THREE.Vector3(0, 0, -1) },
+  u_far:            { value: 220.0 },
+  u_world_style:    { value: 0.0 },
+  u_prev_style:     { value: 0.0 },
+  u_transition:     { value: 1.0 },
+};
 
-// Grid
-const grid = new THREE.GridHelper(200, 60, 0x00ffcc, 0x112222);
-scene.add(grid);
+const vertexShader = `
+  void main() { gl_Position = vec4(position, 1.0); }
+`;
 
-// Partículas de fundo
-const partGeo = new THREE.BufferGeometry();
-const partCount = 400;
-const positions = new Float32Array(partCount * 3);
-for (let i = 0; i < partCount * 3; i++) positions[i] = (Math.random() - 0.5) * 300;
-partGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-const partMat = new THREE.PointsMaterial({ color: 0x00ffcc, size: 0.4, transparent: true, opacity: 0.5 });
-const particles = new THREE.Points(partGeo, partMat);
-scene.add(particles);
+const fragmentShader = `
+  precision highp float;
 
-// Estruturas procedurais
-let estruturas = [];
-let chao = null;       // plano de chão (criado uma vez, recolorido por tema)
-let entidade = null;   // inimigo/criatura central do mundo
+  uniform float u_time;
+  uniform vec2  u_resolution;
+  uniform vec3  u_cameraPosition;
+  uniform vec3  u_cameraDir;
+  uniform float u_far;
+  uniform float u_world_style;
+  uniform float u_prev_style;
+  uniform float u_transition;
 
-function limparEstruturas() {
-  estruturas.forEach(e => scene.remove(e));
-  estruturas = [];
-}
+  const int   MAX_STEPS = 96;
+  const float SURF_DIST = 0.02;
 
-// Tom escuro derivado da cor do tema (para fundo / névoa / chão)
-function corEscura(corHex, f) {
-  const c = new THREE.Color(corHex);
-  c.multiplyScalar(f);
-  return c;
-}
+  float hash(vec3 p){ p=fract(p*0.3183099+0.1); p*=17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+  float hash2(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 
-function gerarEstruturas(corHex, tipo) {
-  limparEstruturas();
-  const corObj = new THREE.Color(corHex);
-
-  // Atmosfera: fundo escuro do tema + névoa exponencial (dá profundidade)
-  const fundo = corEscura(corHex, 0.05);
-  scene.background = fundo;
-  scene.fog = new THREE.FogExp2(fundo.getHex(), 0.016);
-
-  // Chão do cenário (criado uma vez, só recolorido depois)
-  if (!chao) {
-    chao = new THREE.Mesh(
-      new THREE.PlaneGeometry(600, 600),
-      new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0.05 })
-    );
-    chao.rotation.x = -Math.PI / 2;
-    chao.position.y = -0.5;
-    scene.add(chao);
+  float noise2(vec2 x){
+    vec2 i=floor(x), f=fract(x);
+    f=f*f*(3.0-2.0*f);
+    float a=hash2(i+vec2(0,0)), b=hash2(i+vec2(1,0));
+    float c=hash2(i+vec2(0,1)), d=hash2(i+vec2(1,1));
+    return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
   }
-  chao.material.color = corEscura(corHex, 0.16);
+  float noise(vec3 x){
+    vec3 i=floor(x), f=fract(x);
+    f=f*f*(3.0-2.0*f);
+    return mix(
+      mix(mix(hash(i+vec3(0,0,0)),hash(i+vec3(1,0,0)),f.x),
+          mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+      mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),
+          mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),
+      f.z);
+  }
 
-  const mat = new THREE.MeshStandardMaterial({
-    color: corObj, emissive: corObj, emissiveIntensity: 0.4,
-    transparent: true, opacity: 0.85, wireframe: tipo === 'arcane_void'
-  });
-
-  const count = tipo === 'medieval_castle' ? 12 : 16;
-  for (let i = 0; i < count; i++) {
-    const h = 4 + Math.random() * 18;
-    let geo;
-    if (tipo === 'medieval_castle') {
-      geo = new THREE.CylinderGeometry(0.8, 1.2, h, 6);
-    } else if (tipo === 'arcane_void') {
-      geo = new THREE.OctahedronGeometry(1.5 + Math.random() * 2);
-    } else {
-      geo = new THREE.BoxGeometry(1.5 + Math.random(), h, 1.5 + Math.random());
+  float fbmTerrain(vec2 p){
+    float v=0.0, a=0.5;
+    mat2 m=mat2(1.6,1.2,-1.2,1.6);
+    for(int i=0;i<6;i++){ v+=a*noise2(p); p=m*p; a*=0.5; }
+    return v;
+  }
+  float ridgedFbm(vec2 p){
+    float v=0.0, a=0.5;
+    mat2 m=mat2(1.6,1.2,-1.2,1.6);
+    for(int i=0;i<6;i++){
+      float n=noise2(p); n=1.0-abs(n*2.0-1.0); n=n*n;
+      v+=a*n; p=m*p; a*=0.5;
     }
-    const mesh = new THREE.Mesh(geo, mat.clone());
-    const angle = (i / count) * Math.PI * 2;
-    const radius = 14 + Math.random() * 12;
-    mesh.position.set(Math.cos(angle) * radius, h / 2, Math.sin(angle) * radius);
-    mesh.userData.vel = (Math.random() - 0.5) * 0.005;
-    scene.add(mesh);
-    estruturas.push(mesh);
+    return v;
   }
 
-  // Luz colorida no centro
-  pointLight.color.set(corHex);
-  dirLight.color.set(corHex);
-  // GridHelper no r128 tem UM material (não array): trate os dois casos.
-  const gridMat = Array.isArray(grid.material) ? grid.material[0] : grid.material;
-  if (gridMat && gridMat.color) gridMat.color.set(corHex);
-  partMat.color.set(corHex);
+  mat2 rot2(float a){ float c=cos(a),s=sin(a); return mat2(c,-s,s,c); }
+  vec3 sunCol_(float style){ return (style>1.5)?vec3(1.0,0.3,0.9):vec3(1.0,0.92,0.78); }
+
+  float terrainHeight(vec2 xz, float style){
+    if(style<0.5){
+      // ── MUNDO 0: FANTASIA SOMBRIA ──
+      // Montanhas escarpadas, vales profundos, picos góticos
+      float base=fbmTerrain(xz*0.016)*16.0;
+      float peaks=ridgedFbm(xz*0.014)*28.0;
+      float detail=fbmTerrain(xz*0.18)*1.6;
+      float m=smoothstep(0.25,0.75,fbmTerrain(xz*0.007));
+      return mix(base, base+peaks, m)+detail-8.0;
+    } else if(style<1.5){
+      // ── MUNDO 1: SCI-FI ──
+      // Platôs limpos, mesas geométricas, terreno tecnológico
+      vec2 grid=floor(xz*0.08)/0.08;
+      float plateau=fbmTerrain(grid*0.02)*12.0;
+      plateau=floor(plateau*0.5)/0.5; // terraços suaves
+      float ripple=sin(xz.x*0.1)*sin(xz.y*0.1)*0.6;
+      return plateau+ripple-3.0;
+    } else {
+      // ── MUNDO 2: PÓS-APOCALÍPTICO ──
+      // Terreno destruído, crateras, dunas irregulares
+      float dunes=fbmTerrain(xz*0.02)*14.0;
+      float craters=-ridgedFbm(xz*0.05)*6.0; // depressões
+      float rubble=fbmTerrain(xz*0.4)*2.2;
+      return dunes+craters+rubble-5.0;
+    }
+  }
+
+  float objectSDF(vec3 q, float style){
+    if(style<0.5){
+      // ── FANTASIA: torre/pilar gótico com topo pontiagudo ──
+      vec3 b=vec3(0.8,4.0,0.8);
+      vec3 d=abs(q)-b;
+      float tower=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+      // telhado cônico no topo
+      vec3 tp=q-vec3(0.0,4.0,0.0);
+      float cone=max(length(tp.xz)*0.7+tp.y-1.5, -tp.y-1.5);
+      return min(tower, cone);
+    } else if(style<1.5){
+      // ── SCI-FI: monólito/antena tecnológica ──
+      vec3 b=vec3(0.5,3.5,0.5);
+      vec3 d=abs(q)-b;
+      float pillar=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+      // anel orbitando
+      vec3 rp=q-vec3(0.0,3.0,0.0);
+      rp.xz=rot2(u_time*0.8)*rp.xz;
+      float ring=abs(length(rp.xz)-1.6)-0.12;
+      ring=max(ring, abs(rp.y)-0.12);
+      return min(pillar, ring);
+    } else {
+      // ── PÓS-APOCALÍPTICO: ruína quebrada/inclinada ──
+      q.xz=rot2(0.3)*q.xz; // inclinada
+      vec3 b=vec3(1.0,2.5,0.6);
+      vec3 d=abs(q)-b;
+      float wall=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+      // recorte irregular no topo (destruição)
+      float crack=length(max(abs(q-vec3(0.5,2.5,0.0))-vec3(0.8,0.8,1.0),0.0));
+      return max(wall, -(crack-0.4));
+    }
+  }
+
+  float mapStyle(vec3 p, float style){
+    float ground=(p.y-terrainHeight(p.xz,style))*0.6;
+    vec3 q=p;
+    q.xz=mod(q.xz+24.0,48.0)-24.0;
+    float baseY=terrainHeight(vec2(floor(p.x/48.0)*48.0, floor(p.z/48.0)*48.0), style)+3.0;
+    float obj=objectSDF(q-vec3(0.0,baseY,0.0), style);
+    return min(ground, obj);
+  }
+
+  float map(vec3 p){
+    float a=mapStyle(p,u_prev_style);
+    float b=mapStyle(p,u_world_style);
+    return mix(a,b,u_transition);
+  }
+
+  vec3 calcNormal(vec3 p){
+    vec2 e=vec2(0.02,0.0);
+    return normalize(vec3(
+      map(p+e.xyy)-map(p-e.xyy),
+      map(p+e.yxy)-map(p-e.yxy),
+      map(p+e.yyx)-map(p-e.yyx)));
+  }
+
+  float rayMarch(vec3 ro, vec3 rd){
+    float d=0.0;
+    for(int i=0;i<MAX_STEPS;i++){
+      vec3 p=ro+rd*d;
+      float ds=map(p);
+      d+=ds;
+      if(ds<SURF_DIST) break;
+      if(d>u_far) break;
+    }
+    return d;
+  }
+
+  float softShadow(vec3 ro, vec3 rd){
+    float res=1.0, t=0.1;
+    for(int i=0;i<24;i++){
+      float h=map(ro+rd*t);
+      if(h<0.001) return 0.0;
+      res=min(res, 8.0*h/t);
+      t+=clamp(h,0.2,2.0);
+      if(t>40.0) break;
+    }
+    return clamp(res,0.0,1.0);
+  }
+
+  vec3 terrainColor(vec3 p, vec3 n, float style){
+    if(style<0.5){
+      float slope=1.0-n.y;
+      float alt=clamp(p.y*0.03+0.4,0.0,1.0);
+      vec3 rock=vec3(0.32,0.28,0.24);
+      vec3 rockDark=vec3(0.18,0.16,0.14);
+      vec3 grass=vec3(0.20,0.32,0.12);
+      vec3 dirt=vec3(0.36,0.26,0.16);
+      vec3 snow=vec3(0.92,0.93,0.97);
+      float grain=noise(p*2.5)*0.5+noise(p*8.0)*0.25;
+      rock=mix(rockDark,rock,grain);
+      float veg=smoothstep(0.55,0.25,slope)*smoothstep(0.6,0.2,alt);
+      vec3 col=mix(rock,grass,veg);
+      col=mix(col,dirt,smoothstep(0.2,0.5,slope)*(1.0-veg)*0.6);
+      col=mix(col,snow,smoothstep(0.75,0.95,alt)*smoothstep(0.6,0.2,slope));
+      return col;
+    } else if(style<1.5){
+      float alt=clamp(p.y*0.06+0.3,0.0,1.0);
+      vec3 c=vec3(0.3,0.55,0.25);
+      if(alt>0.55) c=vec3(0.5,0.42,0.3);
+      if(alt>0.8) c=vec3(0.9,0.92,0.95);
+      return c;
+    } else {
+      float alt=clamp(p.y*0.05+0.3,0.0,1.0);
+      vec3 c=mix(vec3(0.08,0.0,0.16),vec3(0.6,0.0,0.7),alt);
+      c+=vec3(0.0,0.6,0.9)*pow(alt,3.0);
+      return c;
+    }
+  }
+
+  void main(){
+    vec2 uv=(gl_FragCoord.xy-0.5*u_resolution.xy)/u_resolution.y;
+
+    float glitch=1.0-u_transition;
+    if(glitch>0.001){
+      float line=step(0.96,fract(sin(uv.y*120.0+u_time*30.0)*43758.5));
+      uv.x+=line*glitch*0.08*sin(u_time*40.0);
+    }
+
+    vec3 ro=u_cameraPosition;
+    vec3 fwd=normalize(u_cameraDir);
+    vec3 right=normalize(cross(vec3(0,1,0),fwd));
+    vec3 up=cross(fwd,right);
+    vec3 rd=normalize(uv.x*right+uv.y*up+fwd*1.3);
+
+    float d=rayMarch(ro,rd);
+    float style=mix(u_prev_style,u_world_style,u_transition);
+
+    vec3 sunDir=normalize(vec3(0.5,0.55,0.4));
+    // Névoa por mundo: fantasia roxa, sci-fi azul-aço, pós-apoc âmbar tóxico
+    vec3 fogColor;
+    if(style<0.5)      fogColor=vec3(0.10,0.07,0.16);
+    else if(style<1.5) fogColor=vec3(0.16,0.24,0.34);
+    else               fogColor=vec3(0.34,0.26,0.16);
+    vec3 col;
+
+    if(d<u_far){
+      vec3 p=ro+rd*d;
+      vec3 n=calcNormal(p);
+      vec3 albedo=terrainColor(p,n,style);
+
+      float diff=clamp(dot(n,sunDir),0.0,1.0);
+      float sh=softShadow(p+n*0.05,sunDir);
+      diff*=sh;
+
+      float sky=0.5+0.5*n.y;
+      vec3 skyAmb=mix(vec3(0.12,0.12,0.16),vec3(0.30,0.36,0.48),sky);
+
+      vec3 viewDir=normalize(ro-p);
+      vec3 halfDir=normalize(sunDir+viewDir);
+      float spec=pow(clamp(dot(n,halfDir),0.0,1.0),48.0);
+      // Sci-fi brilha (metal), fantasia fosca, pós-apoc opaco
+      float specMix=(style<0.5)?0.25:(style<1.5)?1.3:0.15;
+
+      vec3 sunCol=sunCol_(style);
+      col=albedo*(skyAmb+sunCol*diff*1.1);
+      col+=sunCol*spec*specMix*sh;
+
+      float fres=pow(1.0-clamp(dot(n,viewDir),0.0,1.0),4.0);
+      col+=fogColor*fres*0.3;
+
+      float fog=1.0-exp(-d*d*0.00018);
+      float sunAmount=clamp(dot(rd,sunDir),0.0,1.0);
+      vec3 fogTinted=mix(fogColor,sunCol,pow(sunAmount,4.0)*0.5);
+      col=mix(col,fogTinted,fog);
+    } else {
+      float grad=clamp(rd.y*0.5+0.5,0.0,1.0);
+      vec3 skyTop;
+      if(style<0.5)      skyTop=vec3(0.06,0.03,0.14); // fantasia: noite roxa
+      else if(style<1.5) skyTop=vec3(0.08,0.16,0.32); // sci-fi: azul profundo
+      else               skyTop=vec3(0.22,0.14,0.10); // pós-apoc: céu de fumaça
+      col=mix(fogColor,skyTop,pow(grad,0.8));
+      float sun=clamp(dot(rd,sunDir),0.0,1.0);
+      col+=sunCol_(style)*pow(sun,256.0)*2.0;
+      col+=sunCol_(style)*pow(sun,8.0)*0.3;
+      // estrelas na fantasia e sci-fi (céu limpo); pós-apoc tem fumaça
+      if(style<1.5){
+        float st=step(0.9985,hash(floor(rd*60.0)));
+        col+=vec3(st)*0.7;
+      }
+    }
+
+    if(glitch>0.001){
+      col+=hash(vec3(gl_FragCoord.xy,u_time))*glitch*0.12;
+    }
+
+    col=pow(col,vec3(0.4545));
+    gl_FragColor=vec4(col,1.0);
+  }
+`;
+
+const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader });
+scene.add(new THREE.Mesh(geometry, material));
+
+// ─── Player ─────────────────────────────────────────────────
+const player = { pos: new THREE.Vector3(0, 22, 0), yaw: 0, pitch: -0.15 };
+const keys = {};
+let pointerLocked = false;
+
+addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keyup',   e => { keys[e.code] = false; });
+
+canvas.addEventListener('click', () => {
+  if (!pointerLocked) canvas.requestPointerLock();
+  else shoot();
+});
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === canvas;
+});
+addEventListener('mousemove', e => {
+  if (!pointerLocked) return;
+  player.yaw   -= e.movementX * 0.0025;
+  player.pitch -= e.movementY * 0.0025;
+  player.pitch = Math.max(-1.4, Math.min(1.4, player.pitch));
+});
+
+function getForward() {
+  return new THREE.Vector3(
+    Math.sin(player.yaw) * Math.cos(player.pitch),
+    Math.sin(player.pitch),
+    Math.cos(player.yaw) * Math.cos(player.pitch)
+  ).normalize();
 }
 
-// Inimigo/criatura central — o "sujeito" visível do mundo gerado
-function renderizarEntidade(corHex, modo) {
-  if (entidade) {
-    scene.remove(entidade);
-    entidade.geometry.dispose();
-    entidade.material.dispose();
-    entidade = null;
-  }
-  const corObj = new THREE.Color(corHex);
-  // criatura (captura) = forma orgânica; inimigo (batalha) = forma angular
-  const geo = modo === 'captura'
-    ? new THREE.IcosahedronGeometry(3.2, 0)
-    : new THREE.DodecahedronGeometry(3.2, 0);
-  entidade = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-    color: corObj, emissive: corObj, emissiveIntensity: 0.7, flatShading: true
-  }));
-  entidade.position.set(0, 4, 0);
-  scene.add(entidade);
+// ─── Transição de estilo ────────────────────────────────────
+const styleTransition = { active: false, t: 1.0, duration: 1.5 };
+const STYLE_NAMES = ['Fantasia Sombria', 'Sci-Fi', 'Pós-Apocalíptico'];
+
+function changeStyle(newStyle) {
+  if (newStyle === uniforms.u_world_style.value) return;
+  uniforms.u_prev_style.value = uniforms.u_world_style.value;
+  uniforms.u_world_style.value = newStyle;
+  uniforms.u_transition.value = 0.0;
+  styleTransition.active = true;
+  styleTransition.t = 0.0;
+  document.getElementById('styleTxt').textContent = STYLE_NAMES[newStyle];
+  sendAction({ action_type: 'SET_STYLE', world_style: newStyle });
+  showToast('FUNDINDO: ' + STYLE_NAMES[newStyle]);
 }
 
-// Animação
-let t = 0;
-function animate() {
-  requestAnimationFrame(animate);
-  t += 0.008;
-  camera.position.x = Math.sin(t * 0.2) * 5;
-  camera.position.z = 28 + Math.sin(t * 0.15) * 4;
-  camera.lookAt(0, 2, 0);
-  particles.rotation.y += 0.0003;
-  estruturas.forEach(e => {
-    e.rotation.y += e.userData.vel;
-    e.position.y += Math.sin(t + e.rotation.y) * 0.005;
-  });
-  if (entidade) {
-    entidade.rotation.y += 0.01;
-    entidade.rotation.x = Math.sin(t * 0.5) * 0.15;
-    entidade.position.y = 4 + Math.sin(t * 1.5) * 0.4;
+// ─── WebSocket ──────────────────────────────────────────────
+const PLAYER_ID = 'player_' + Math.random().toString(36).slice(2, 8);
+let ws = null, reconnDelay = 1000, reconnTimer = null;
+let inventory = {}, score = 0, chunkSize = 16;
+const localModified = new Set();
+
+function wsUrl() {
+  const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const h = location.host;
+  if (h.includes('.app.github.dev')) {
+    const fh = h.replace(/^([^-]+)-\d+(.app\.github\.dev.*)$/, '$1-8000$2');
+    return `wss://${fh}/ws/${PLAYER_ID}`;
   }
+  return `${p}//${h}/ws/${PLAYER_ID}`;
+}
+function setWsState(txt, cls) {
+  const el = document.getElementById('wsState');
+  el.textContent = txt; el.className = cls;
+}
+function connect() {
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+  setWsState('conectando…', 'wait');
+  try { ws = new WebSocket(wsUrl()); }
+  catch (e) { scheduleReconnect(); return; }
+  ws.onopen = () => { setWsState('online', 'ok'); reconnDelay = 1000; };
+  ws.onclose = () => { setWsState('offline', 'bad'); scheduleReconnect(); };
+  ws.onerror = () => {};
+  ws.onmessage = e => { try { onServerMsg(JSON.parse(e.data)); } catch (_) {} };
+}
+function scheduleReconnect() {
+  clearTimeout(reconnTimer);
+  reconnTimer = setTimeout(() => {
+    reconnDelay = Math.min(reconnDelay * 1.5, 8000);
+    connect();
+  }, reconnDelay);
+}
+function sendAction(obj) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ player_id: PLAYER_ID, ...obj }));
+}
+
+function onServerMsg(d) {
+  switch (d.status) {
+    case 'CONNECTED':
+      if (d.chunk_size) chunkSize = d.chunk_size;
+      if (d.player_state) applyState(d.player_state);
+      break;
+    case 'DESTROYED':
+      triggerExplosion();
+      if (d.target_id) localModified.add(d.target_id);
+      if (d.player_state) applyState(d.player_state);
+      break;
+    case 'COLLECTED':
+      if (d.target_id) localModified.add(d.target_id);
+      if (d.player_state) applyState(d.player_state);
+      break;
+    case 'PLAYER_HIT':
+      triggerDamageFlash();
+      if (d.player_state) applyState(d.player_state);
+      break;
+    case 'CHUNK_RECONCILE':
+      if (d.modified) {
+        Object.keys(d.modified).forEach(oid => localModified.add(oid));
+        showToast('Mundo reconciliado · chunk ' + d.chunk.join(','));
+      }
+      break;
+    default: break;
+  }
+}
+function applyState(s) {
+  if (s.inventory) inventory = s.inventory;
+  if (typeof s.score === 'number') score = s.score;
+  renderInventory();
+}
+function renderInventory() {
+  const list = document.getElementById('invList');
+  const items = Object.entries(inventory);
+  list.innerHTML = items.length ? items.map(([k,v]) => `${k}: <b>${v}</b>`).join('<br>') : 'vazio';
+  document.getElementById('scoreTxt').textContent = score;
+}
+
+function shoot() {
+  const oid = 'orb_' + Math.floor(player.pos.x) + '_' + Math.floor(player.pos.z);
+  if (localModified.has(oid)) return;
+  sendAction({ action_type: 'SHOOT', target_id: oid, target_tags: ['destruivel', 'hostil'] });
+}
+
+// ─── Efeitos ────────────────────────────────────────────────
+function triggerExplosion() { showToast('💥 DESTRUÍDO'); }
+function triggerDamageFlash() {
+  const f = document.getElementById('flash');
+  f.style.opacity = '0.5';
+  setTimeout(() => { f.style.opacity = '0'; }, 150);
+}
+let toastTimer = null;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1600);
+}
+
+// ─── UI ─────────────────────────────────────────────────────
+document.getElementById('fuseBtn').addEventListener('click', () => {
+  const sel = parseInt(document.getElementById('styleSel').value, 10);
+  const btn = document.getElementById('fuseBtn');
+  btn.disabled = true;
+  changeStyle(sel);
+  setTimeout(() => { btn.disabled = false; }, 1600);
+});
+
+// ─── Loop ───────────────────────────────────────────────────
+const clock = new THREE.Clock();
+let fpsT = 0, fpsCount = 0, moveSendT = 0;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  uniforms.u_time.value += dt;
+
+  if (styleTransition.active) {
+    styleTransition.t += dt / styleTransition.duration;
+    if (styleTransition.t >= 1.0) {
+      styleTransition.t = 1.0;
+      styleTransition.active = false;
+      uniforms.u_prev_style.value = uniforms.u_world_style.value;
+    }
+    const e = styleTransition.t;
+    uniforms.u_transition.value = e * e * (3.0 - 2.0 * e);
+  }
+
+  const speed = (keys['ShiftLeft'] ? 22 : 12) * dt;
+  const fwd = getForward();
+  const flat = new THREE.Vector3(fwd.x, 0, fwd.z).normalize();
+  const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), flat).normalize();
+  if (keys['KeyW']) player.pos.addScaledVector(flat, speed);
+  if (keys['KeyS']) player.pos.addScaledVector(flat, -speed);
+  if (keys['KeyA']) player.pos.addScaledVector(right, speed);
+  if (keys['KeyD']) player.pos.addScaledVector(right, -speed);
+  if (keys['Space']) player.pos.y += speed;
+  if (keys['ControlLeft']) player.pos.y -= speed;
+  player.pos.y = Math.max(player.pos.y, 3.0);
+
+  uniforms.u_cameraPosition.value.copy(player.pos);
+  uniforms.u_cameraDir.value.copy(getForward());
+
+  moveSendT += dt;
+  if (moveSendT > 0.1) {
+    moveSendT = 0;
+    sendAction({ action_type: 'MOVE', position: [player.pos.x, player.pos.y, player.pos.z] });
+  }
+
+  document.getElementById('posTxt').textContent =
+    `${player.pos.x.toFixed(1)}, ${player.pos.y.toFixed(1)}, ${player.pos.z.toFixed(1)}`;
+  const cx = Math.floor(player.pos.x / chunkSize);
+  const cz = Math.floor(player.pos.z / chunkSize);
+  document.getElementById('chunkTxt').textContent = `${cx}, ${cz}`;
+
+  fpsCount++; fpsT += dt;
+  if (fpsT >= 0.5) {
+    document.getElementById('fps').textContent = Math.round(fpsCount / fpsT);
+    fpsCount = 0; fpsT = 0;
+  }
+
   renderer.render(scene, camera);
 }
-animate();
 
-window.addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
+addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
+  uniforms.u_resolution.value.set(innerWidth, innerHeight);
 });
 
-// ===================== LÓGICA DO JOGO =====================
-function gerarMundo() {
-  const input = document.getElementById('prompt-input').value.trim();
-  if (!input) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    logMsg('⚠️ Sem conexão com o servidor.', 'sys'); return;
-  }
-  document.getElementById('btn-criar').disabled = true;
-  document.getElementById('titulo').classList.add('oculto');
-  ws.send(JSON.stringify({ api_key: API_KEY, prompt: input }));
-
-  clearTimeout(criarTimeout);
-  criarTimeout = setTimeout(() => {
-    logMsg('⚠️ O servidor não respondeu a tempo. Verifique a conexão e tente de novo.', 'sys');
-    document.getElementById('btn-criar').disabled = false;
-  }, 8000);
-}
-
-document.getElementById('prompt-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') gerarMundo();
-});
-
-function enviarAcao(acao) {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !estadoJogo || batalhaEncerrada) return;
-  setBotoesAtivos(false);
-  ws.send(JSON.stringify({ api_key: API_KEY, acao, estado: estadoJogo }));
-}
-
-function processarMensagem(data) {
-  if (data.status === 'MOLDANDO_UNIVERSO') {
-    logBox(true);
-    logMsg('⚙️ ' + data.message, 'sys');
-    return;
-  }
-
-  if (data.status === 'UNIVERSO_PRONTO') {
-    clearTimeout(criarTimeout);
-    estadoJogo = data;
-    cor = data.cor_tema;
-    batalhaEncerrada = false;
-    // A cena 3D é "best-effort": se algo falhar, o jogo (HUD + ações) continua jogável.
-    try {
-      gerarEstruturas(cor, data.skybox);
-      renderizarEntidade(cor, data.modo);
-    } catch (err) {
-      console.error('Falha ao renderizar a cena 3D:', err);
-    }
-    mostrarGenero(data.genero);
-    document.getElementById('i-titulo').textContent =
-      data.modo === 'captura' ? 'Criatura Selvagem' : 'Inimigo';
-    atualizarHUD(data.heroi, data.inimigo);
-    renderizarBotoes(data.habilidades, data.modo);
-    data.log.forEach(l => logMsg(l, 'acao'));
-    setBotoesAtivos(true);
-    document.getElementById('btn-criar').disabled = false;
-    document.getElementById('input-wrap').style.opacity = '0.5';
-    return;
-  }
-
-  if (data.status === 'ESTADO_ATUALIZADO') {
-    const e = data.estado;
-    estadoJogo = e;
-    atualizarHUD(e.heroi, e.inimigo);
-    e.log.forEach(l => {
-      const cls = l.includes('👹') ? 'inimigo'
-        : (l.includes('VITÓRIA') || l.includes('🎯')) ? 'vitoria'
-        : l.includes('DERROTA') ? 'derrota'
-        : (l.includes('💨') || l.includes('❌')) ? 'sys'
-        : 'acao';
-      logMsg(l, cls);
-    });
-    if (e.batalha_encerrada) {
-      batalhaEncerrada = true;
-      setBotoesAtivos(false);
-      document.getElementById('btn-criar').disabled = false;
-      document.getElementById('input-wrap').style.opacity = '1';
-    } else {
-      setBotoesAtivos(true);
-    }
-    return;
-  }
-
-  if (data.status === 'ERRO_PAYLOAD' || data.status === 'RATE_LIMITED') {
-    logMsg('⚠️ ' + data.message, 'sys');
-    document.getElementById('btn-criar').disabled = false;
-  }
-}
-
-function atualizarHUD(heroi, inimigo) {
-  document.getElementById('hud-heroi').style.display = 'block';
-  document.getElementById('hud-inimigo').style.display = 'block';
-  document.getElementById('h-classe').textContent = heroi.classe;
-  document.getElementById('h-vida-val').textContent = `${heroi.vida}/${heroi.vida_max}`;
-  document.getElementById('h-vida-bar').style.width = `${Math.max(0, heroi.vida / heroi.vida_max * 100)}%`;
-  document.getElementById('h-mana-val').textContent = `${heroi.mana}/${heroi.mana_max}`;
-  document.getElementById('h-mana-bar').style.width = `${Math.max(0, heroi.mana / heroi.mana_max * 100)}%`;
-  document.getElementById('i-nome').textContent = inimigo.nome;
-  document.getElementById('i-vida-val').textContent = `${inimigo.vida}/${inimigo.vida_max}`;
-  document.getElementById('i-vida-bar').style.width = `${Math.max(0, inimigo.vida / inimigo.vida_max * 100)}%`;
-}
-
-function mostrarGenero(genero) {
-  if (!genero) return;
-  const el = document.getElementById('genero-badge');
-  const corCSS = `#${cor.toString(16).padStart(6, '0')}`;
-  el.style.setProperty('--cor', corCSS);
-  const conf = Math.round((genero.confianca || 0) * 100);
-  el.innerHTML = `🧬 ${genero.nome}<span class="conf">${conf}% match</span>`;
-  el.style.display = 'block';
-}
-
-function renderizarBotoes(habilidades, modo) {
-  const wrap = document.getElementById('acoes-wrap');
-  wrap.innerHTML = '';
-  wrap.style.display = 'flex';
-  const corCSS = `#${cor.toString(16).padStart(6, '0')}`;
-
-  const btnAtk = document.createElement('button');
-  btnAtk.className = 'btn-acao';
-  btnAtk.style = `--cor:${corCSS}`;
-  btnAtk.textContent = '⚔️ ATACAR';
-  btnAtk.onclick = () => enviarAcao('ATACAR');
-  wrap.appendChild(btnAtk);
-
-  habilidades.forEach((hab, i) => {
-    const btn = document.createElement('button');
-    btn.className = 'btn-acao';
-    btn.style = `--cor:${corCSS}`;
-    btn.textContent = `✨ ${hab.nome} (${hab.custo_mana} MP)`;
-    btn.title = hab.descricao;
-    btn.onclick = () => enviarAcao(`HABILIDADE_${i}`);
-    wrap.appendChild(btn);
-  });
-
-  // O modo "captura" (Gene Classifier -> creature_collector) habilita capturar.
-  if (modo === 'captura') {
-    const btnCap = document.createElement('button');
-    btnCap.className = 'btn-acao';
-    btnCap.style = `--cor:${corCSS}`;
-    btnCap.textContent = '🎯 CAPTURAR';
-    btnCap.title = 'Maior chance quanto mais fraca estiver a criatura';
-    btnCap.onclick = () => enviarAcao('CAPTURAR');
-    wrap.appendChild(btnCap);
-  }
-}
-
-function setBotoesAtivos(ativo) {
-  document.querySelectorAll('.btn-acao').forEach(b => b.disabled = !ativo);
-}
-
-const logBoxEl = document.getElementById('log-box');
-
-function logBox(show) {
-  logBoxEl.style.display = show ? 'block' : 'none';
-}
-
-function logMsg(texto, tipo) {
-  logBox(true);
-  const p = document.createElement('p');
-  p.className = tipo || '';
-  p.textContent = texto;
-  logBoxEl.appendChild(p);
-  logBoxEl.scrollTop = logBoxEl.scrollHeight;
-}
+connect();
+renderInventory();
+loop();
 </script>
 </body>
 </html>
