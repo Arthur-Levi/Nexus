@@ -64,7 +64,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
 
 <div id="inv"><b>INVENTÁRIO</b><div id="invList">vazio</div><div style="margin-top:4px">Score: <b id="scoreTxt">0</b></div></div>
 
-<div id="help">WASD mover · MOUSE olhar · CLICK travar/atirar · ESPAÇO subir · CTRL descer</div>
+<div id="help">WASD mover · MOUSE olhar · ESPAÇO pular · V voar · CLICK travar/atirar · SHIFT correr</div>
 
 <div id="panel">
   <h3>Fusão de Universos</h3>
@@ -123,8 +123,8 @@ const fragmentShader = `
   uniform float u_prev_style;
   uniform float u_transition;
 
-  const int   MAX_STEPS = 96;
-  const float SURF_DIST = 0.02;
+  const int   MAX_STEPS = 80;
+  const float SURF_DIST = 0.03;
 
   float hash(vec3 p){ p=fract(p*0.3183099+0.1); p*=17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
   float hash2(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
@@ -230,23 +230,32 @@ const fragmentShader = `
     float ground=(p.y-terrainHeight(p.xz,style))*0.6;
     vec3 q=p;
     q.xz=mod(q.xz+24.0,48.0)-24.0;
-    float baseY=terrainHeight(vec2(floor(p.x/48.0)*48.0, floor(p.z/48.0)*48.0), style)+3.0;
+    // Centro real do bloco onde o objeto está (não o canto)
+    vec2 cellCenter=(floor(p.xz/48.0)+0.5)*48.0;
+    float baseY=terrainHeight(cellCenter, style)+2.0;
     float obj=objectSDF(q-vec3(0.0,baseY,0.0), style);
     return min(ground, obj);
   }
 
   float map(vec3 p){
+    // Otimização: quando não há transição, computa só um mundo (metade do custo)
+    if(u_transition >= 0.999){
+      return mapStyle(p, u_world_style);
+    }
     float a=mapStyle(p,u_prev_style);
     float b=mapStyle(p,u_world_style);
     return mix(a,b,u_transition);
   }
 
   vec3 calcNormal(vec3 p){
-    vec2 e=vec2(0.02,0.0);
-    return normalize(vec3(
-      map(p+e.xyy)-map(p-e.xyy),
-      map(p+e.yxy)-map(p-e.yxy),
-      map(p+e.yyx)-map(p-e.yyx)));
+    // Técnica tetraedro: 4 chamadas a map() em vez de 6
+    const vec2 k=vec2(1.0,-1.0);
+    const float h=0.04;
+    return normalize(
+      k.xyy*map(p+k.xyy*h)+
+      k.yyx*map(p+k.yyx*h)+
+      k.yxy*map(p+k.yxy*h)+
+      k.xxx*map(p+k.xxx*h));
   }
 
   float rayMarch(vec3 ro, vec3 rd){
@@ -255,20 +264,21 @@ const fragmentShader = `
       vec3 p=ro+rd*d;
       float ds=map(p);
       d+=ds;
-      if(ds<SURF_DIST) break;
+      // Tolerância de superfície relaxa com a distância (objetos longe = menos precisão)
+      if(ds < SURF_DIST*(1.0+d*0.05)) break;
       if(d>u_far) break;
     }
     return d;
   }
 
   float softShadow(vec3 ro, vec3 rd){
-    float res=1.0, t=0.1;
-    for(int i=0;i<24;i++){
+    float res=1.0, t=0.5;
+    for(int i=0;i<12;i++){
       float h=map(ro+rd*t);
-      if(h<0.001) return 0.0;
-      res=min(res, 8.0*h/t);
-      t+=clamp(h,0.2,2.0);
-      if(t>40.0) break;
+      if(h<0.01) return 0.0;
+      res=min(res, 10.0*h/t);
+      t+=clamp(h,0.4,3.0);
+      if(t>35.0) break;
     }
     return clamp(res,0.0,1.0);
   }
@@ -335,7 +345,8 @@ const fragmentShader = `
       vec3 albedo=terrainColor(p,n,style);
 
       float diff=clamp(dot(n,sunDir),0.0,1.0);
-      float sh=softShadow(p+n*0.05,sunDir);
+      // Sombra só nos objetos próximos (longe não compensa o custo)
+      float sh = (d < 60.0) ? softShadow(p+n*0.06,sunDir) : 1.0;
       diff*=sh;
 
       float sky=0.5+0.5*n.y;
@@ -387,12 +398,98 @@ const fragmentShader = `
 const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader });
 scene.add(new THREE.Mesh(geometry, material));
 
-// ─── Player ─────────────────────────────────────────────────
+// ─── FÍSICA: altura do terreno replicada em JS ──────────────
+// Espelha exatamente a função terrainHeight do shader, para o
+// player saber onde está o chão (colisão + gravidade).
+function hash2(x, y) {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+function noise2(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  let fx = x - ix, fy = y - iy;
+  fx = fx * fx * (3 - 2 * fx);
+  fy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy), b = hash2(ix + 1, iy);
+  const c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  return (a + (b - a) * fx) + ((c - a) * fy) + ((a - b - c + d) * fx * fy);
+}
+function fbmTerrain(x, y) {
+  let v = 0, a = 0.5;
+  // matriz de rotação fixa (mesmos coef. do shader: 1.6,1.2,-1.2,1.6)
+  for (let i = 0; i < 6; i++) {
+    v += a * noise2(x, y);
+    const nx = 1.6 * x + 1.2 * y;
+    const ny = -1.2 * x + 1.6 * y;
+    x = nx; y = ny;
+    a *= 0.5;
+  }
+  return v;
+}
+function ridgedFbm(x, y) {
+  let v = 0, a = 0.5;
+  for (let i = 0; i < 6; i++) {
+    let n = noise2(x, y);
+    n = 1 - Math.abs(n * 2 - 1);
+    n = n * n;
+    v += a * n;
+    const nx = 1.6 * x + 1.2 * y;
+    const ny = -1.2 * x + 1.6 * y;
+    x = nx; y = ny;
+    a *= 0.5;
+  }
+  return v;
+}
+function smoothstep(e0, e1, x) {
+  const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+}
+function terrainHeightJS(x, z, style) {
+  if (style < 0.5) {
+    // Fantasia Sombria
+    const base = fbmTerrain(x * 0.016, z * 0.016) * 16;
+    const peaks = ridgedFbm(x * 0.014, z * 0.014) * 28;
+    const detail = fbmTerrain(x * 0.18, z * 0.18) * 1.6;
+    const m = smoothstep(0.25, 0.75, fbmTerrain(x * 0.007, z * 0.007));
+    return base + (peaks * m) + detail - 8;
+  } else if (style < 1.5) {
+    // Sci-Fi
+    const gx = Math.floor(x * 0.08) / 0.08;
+    const gz = Math.floor(z * 0.08) / 0.08;
+    let plateau = fbmTerrain(gx * 0.02, gz * 0.02) * 12;
+    plateau = Math.floor(plateau * 0.5) / 0.5;
+    const ripple = Math.sin(x * 0.1) * Math.sin(z * 0.1) * 0.6;
+    return plateau + ripple - 3;
+  } else {
+    // Pós-Apocalíptico
+    const dunes = fbmTerrain(x * 0.02, z * 0.02) * 14;
+    const craters = -ridgedFbm(x * 0.05, z * 0.05) * 6;
+    const rubble = fbmTerrain(x * 0.4, z * 0.4) * 2.2;
+    return dunes + craters + rubble - 5;
+  }
+}
+
+// ─── Estado físico do player ────────────────────────────────
+const physics = {
+  velY: 0,
+  onGround: false,
+  gravity: -32,
+  jumpForce: 12,
+  eyeHeight: 2.5,   // altura dos olhos acima do chão
+  flyMode: false,   // alterna com tecla V
+};
 const player = { pos: new THREE.Vector3(0, 22, 0), yaw: 0, pitch: -0.15 };
 const keys = {};
 let pointerLocked = false;
 
-addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyV') {
+    physics.flyMode = !physics.flyMode;
+    physics.velY = 0;
+    showToast(physics.flyMode ? '🕊️ Modo voo' : '🚶 Modo a pé');
+  }
+});
 addEventListener('keyup',   e => { keys[e.code] = false; });
 
 canvas.addEventListener('click', () => {
@@ -548,6 +645,22 @@ document.getElementById('fuseBtn').addEventListener('click', () => {
 const clock = new THREE.Clock();
 let fpsT = 0, fpsCount = 0, moveSendT = 0;
 
+// Resolução adaptativa — ajusta qualidade para manter FPS fluido
+let currentScale = Math.min(devicePixelRatio, 1.5);
+let fpsHistory = [];
+function adaptResolution(fps) {
+  fpsHistory.push(fps);
+  if (fpsHistory.length > 4) fpsHistory.shift();
+  const avg = fpsHistory.reduce((a,b) => a+b, 0) / fpsHistory.length;
+  let target = currentScale;
+  if (avg < 30 && currentScale > 0.6) target = currentScale - 0.15;       // travando: baixa qualidade
+  else if (avg > 55 && currentScale < Math.min(devicePixelRatio, 1.5)) target = currentScale + 0.1; // sobrando: melhora
+  if (Math.abs(target - currentScale) > 0.01) {
+    currentScale = Math.max(0.5, Math.min(target, 2.0));
+    renderer.setPixelRatio(currentScale);
+  }
+}
+
 function loop() {
   requestAnimationFrame(loop);
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -572,9 +685,33 @@ function loop() {
   if (keys['KeyS']) player.pos.addScaledVector(flat, -speed);
   if (keys['KeyA']) player.pos.addScaledVector(right, speed);
   if (keys['KeyD']) player.pos.addScaledVector(right, -speed);
-  if (keys['Space']) player.pos.y += speed;
-  if (keys['ControlLeft']) player.pos.y -= speed;
-  player.pos.y = Math.max(player.pos.y, 3.0);
+
+  const groundY = terrainHeightJS(player.pos.x, player.pos.z, uniforms.u_world_style.value) + physics.eyeHeight;
+
+  if (physics.flyMode) {
+    // Modo voo livre (espaço/ctrl)
+    if (keys['Space']) player.pos.y += speed;
+    if (keys['ControlLeft']) player.pos.y -= speed;
+    player.pos.y = Math.max(player.pos.y, groundY);
+    physics.velY = 0;
+  } else {
+    // Física: gravidade + colisão com terreno + pulo
+    physics.velY += physics.gravity * dt;
+    player.pos.y += physics.velY * dt;
+
+    if (player.pos.y <= groundY) {
+      player.pos.y = groundY;
+      physics.velY = 0;
+      physics.onGround = true;
+    } else {
+      physics.onGround = false;
+    }
+    // Pulo
+    if (keys['Space'] && physics.onGround) {
+      physics.velY = physics.jumpForce;
+      physics.onGround = false;
+    }
+  }
 
   uniforms.u_cameraPosition.value.copy(player.pos);
   uniforms.u_cameraDir.value.copy(getForward());
@@ -593,7 +730,9 @@ function loop() {
 
   fpsCount++; fpsT += dt;
   if (fpsT >= 0.5) {
-    document.getElementById('fps').textContent = Math.round(fpsCount / fpsT);
+    const fps = Math.round(fpsCount / fpsT);
+    document.getElementById('fps').textContent = fps;
+    adaptResolution(fps);
     fpsCount = 0; fpsT = 0;
   }
 
@@ -607,6 +746,8 @@ addEventListener('resize', () => {
 
 connect();
 renderInventory();
+// Posiciona o player na altura correta do terreno antes de começar
+player.pos.y = terrainHeightJS(player.pos.x, player.pos.z, 0) + physics.eyeHeight;
 loop();
 </script>
 </body>
