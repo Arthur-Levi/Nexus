@@ -54,6 +54,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
   <div>WS: <span id="wsState" class="wait">conectando…</span></div>
   <div>Pos: <span id="posTxt">0, 0, 0</span></div>
   <div>Chunk: <span id="chunkTxt">0, 0</span></div>
+  <div id="dbgLine" style="display:none">Chão JS: <span id="groundTxt">—</span> | Gap: <span id="gapTxt">—</span></div>
 </div>
 
 <div id="stats">
@@ -96,6 +97,21 @@ const scene = new THREE.Scene();
 const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const geometry = new THREE.PlaneGeometry(2, 2);
 
+// ─── Heightmap: JS como fonte única de verdade para terreno ──
+// JS gera um Float32Array → sobe como DataTexture → shader lê
+// os mesmos valores que a física usa. Divergência eliminada.
+const HMAP_RES  = 256;
+const HMAP_HALF = 64.0;   // ±64 world units cobertos
+const hmapData  = new Float32Array(HMAP_RES * HMAP_RES);
+const hmapCenter = { x: 0, z: 0 };
+let hmapStyle = -1;
+let hmapNeedsRebuild = true;
+const hmapTexture = new THREE.DataTexture(
+  hmapData, HMAP_RES, HMAP_RES, THREE.RedFormat, THREE.FloatType
+);
+hmapTexture.minFilter = THREE.LinearFilter;
+hmapTexture.magFilter = THREE.LinearFilter;
+
 const uniforms = {
   u_time:           { value: 0.0 },
   u_resolution:     { value: new THREE.Vector2(innerWidth, innerHeight) },
@@ -104,7 +120,10 @@ const uniforms = {
   u_far:            { value: 220.0 },
   u_world_style:    { value: 0.0 },
   u_prev_style:     { value: 0.0 },
-  u_transition:     { value: 1.0 },
+  u_transition:        { value: 1.0 },
+  u_heightmap:         { value: hmapTexture },
+  u_heightmap_center:  { value: new THREE.Vector2(0, 0) },
+  u_heightmap_half:    { value: HMAP_HALF },
 };
 
 const vertexShader = `
@@ -122,6 +141,9 @@ const fragmentShader = `
   uniform float u_world_style;
   uniform float u_prev_style;
   uniform float u_transition;
+  uniform sampler2D u_heightmap;
+  uniform vec2  u_heightmap_center;
+  uniform float u_heightmap_half;
 
   const int   MAX_STEPS = 80;
   const float SURF_DIST = 0.03;
@@ -227,7 +249,10 @@ const fragmentShader = `
   }
 
   float mapStyle(vec3 p, float style){
-    float ground=(p.y-terrainHeight(p.xz,style))*0.6;
+    vec2 hUV=(p.xz-u_heightmap_center)/(u_heightmap_half*2.0)+0.5;
+    bool inHmap=u_transition>=0.999&&hUV.x>=0.0&&hUV.x<=1.0&&hUV.y>=0.0&&hUV.y<=1.0;
+    float terrainH=inHmap?texture2D(u_heightmap,hUV).r:terrainHeight(p.xz,style);
+    float ground=(p.y-terrainH)*0.6;
     vec3 q=p;
     q.xz=mod(q.xz+24.0,48.0)-24.0;
     // Centro real do bloco onde o objeto está (não o canto)
@@ -469,6 +494,73 @@ function terrainHeightJS(x, z, style) {
   }
 }
 
+function buildHeightmap(cx, cz, style) {
+  const step = (HMAP_HALF * 2) / HMAP_RES;
+  const ox = cx - HMAP_HALF, oz = cz - HMAP_HALF;
+  for (let j = 0; j < HMAP_RES; j++) {
+    for (let i = 0; i < HMAP_RES; i++) {
+      hmapData[j * HMAP_RES + i] = terrainHeightJS(
+        ox + (i + 0.5) * step, oz + (j + 0.5) * step, style
+      );
+    }
+  }
+  hmapCenter.x = cx; hmapCenter.z = cz; hmapStyle = style;
+  hmapTexture.needsUpdate = true;
+  uniforms.u_heightmap_center.value.set(cx, cz);
+}
+function sampleHeightmap(x, z) {
+  const ux = (x - hmapCenter.x) / (HMAP_HALF * 2) + 0.5;
+  const uz = (z - hmapCenter.z) / (HMAP_HALF * 2) + 0.5;
+  if (ux < 0 || ux > 1 || uz < 0 || uz > 1)
+    return terrainHeightJS(x, z, hmapStyle);
+  const px = ux * HMAP_RES - 0.5, pz = uz * HMAP_RES - 0.5;
+  const ix = Math.max(0, Math.min(HMAP_RES - 2, Math.floor(px)));
+  const iz = Math.max(0, Math.min(HMAP_RES - 2, Math.floor(pz)));
+  const fx = px - ix, fz = pz - iz;
+  const a = hmapData[iz * HMAP_RES + ix],       b = hmapData[iz * HMAP_RES + ix + 1];
+  const c = hmapData[(iz + 1) * HMAP_RES + ix], d = hmapData[(iz + 1) * HMAP_RES + ix + 1];
+  return a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz;
+}
+
+// ─── Colisão com objetos (SDF → cilindro approximado) ───────
+// Objetos repetem a cada 48 unidades (grid de células).
+// Cada célula tem exatamente um objeto no centro; checamos 3×3 células vizinhas.
+const OBJ_CELL = 48.0;
+const PLAYER_RADIUS = 0.4;
+const OBJ_CONFIGS = [
+  { radius: 1.1, bottom: -4.0, top: 6.0  }, // Fantasia: torre gótica
+  { radius: 0.8, bottom: -3.5, top: 4.0  }, // Sci-Fi: monólito/antena
+  { radius: 1.3, bottom: -2.5, top: 3.5  }, // Pós-Apoc: ruína inclinada (maior raio para compensar a rotação)
+];
+
+function applyObjectCollisions(pos, style) {
+  const cfg = OBJ_CONFIGS[Math.round(style)] || OBJ_CONFIGS[0];
+  const minDist = cfg.radius + PLAYER_RADIUS;
+  const minDist2 = minDist * minDist;
+  const playerFeet = pos.y - physics.eyeHeight;
+  const playerHead = pos.y + 0.3;
+  const cx = Math.floor(pos.x / OBJ_CELL);
+  const cz = Math.floor(pos.z / OBJ_CELL);
+  for (let di = -1; di <= 1; di++) {
+    for (let dj = -1; dj <= 1; dj++) {
+      const ox = (cx + di + 0.5) * OBJ_CELL;
+      const oz = (cz + dj + 0.5) * OBJ_CELL;
+      // baseY: mesmo cálculo do shader (terrainHeight(cellCenter) + 2)
+      const baseY = sampleHeightmap(ox, oz) + 2.0;
+      // Descarta se o player está acima ou abaixo do objeto
+      if (playerFeet >= baseY + cfg.top || playerHead <= baseY + cfg.bottom) continue;
+      const dx = pos.x - ox, dz = pos.z - oz;
+      const dist2 = dx * dx + dz * dz;
+      if (dist2 >= minDist2 || dist2 === 0) continue;
+      // Push-out horizontal: empurra o player para fora do cilindro
+      const dist = Math.sqrt(dist2);
+      const push = minDist - dist;
+      pos.x += (dx / dist) * push;
+      pos.z += (dz / dist) * push;
+    }
+  }
+}
+
 // ─── Estado físico do player ────────────────────────────────
 const physics = {
   velY: 0,
@@ -488,6 +580,10 @@ addEventListener('keydown', e => {
     physics.flyMode = !physics.flyMode;
     physics.velY = 0;
     showToast(physics.flyMode ? '🕊️ Modo voo' : '🚶 Modo a pé');
+  }
+  if (e.code === 'F3') {
+    const dl = document.getElementById('dbgLine');
+    dl.style.display = dl.style.display === 'none' ? '' : 'none';
   }
 });
 addEventListener('keyup',   e => { keys[e.code] = false; });
@@ -672,6 +768,7 @@ function loop() {
       styleTransition.t = 1.0;
       styleTransition.active = false;
       uniforms.u_prev_style.value = uniforms.u_world_style.value;
+      hmapNeedsRebuild = true; // regenera heightmap para o novo estilo
     }
     const e = styleTransition.t;
     uniforms.u_transition.value = e * e * (3.0 - 2.0 * e);
@@ -686,7 +783,16 @@ function loop() {
   if (keys['KeyA']) player.pos.addScaledVector(right, speed);
   if (keys['KeyD']) player.pos.addScaledVector(right, -speed);
 
-  const groundY = terrainHeightJS(player.pos.x, player.pos.z, uniforms.u_world_style.value) + physics.eyeHeight;
+  const style = uniforms.u_world_style.value;
+  if (!styleTransition.active) {
+    const dx = player.pos.x - hmapCenter.x, dz = player.pos.z - hmapCenter.z;
+    if (hmapNeedsRebuild || dx * dx + dz * dz > 32 * 32 || style !== hmapStyle)
+      buildHeightmap(player.pos.x, player.pos.z, style);
+    hmapNeedsRebuild = false;
+  }
+  const groundY = (styleTransition.active
+    ? terrainHeightJS(player.pos.x, player.pos.z, style)
+    : sampleHeightmap(player.pos.x, player.pos.z)) + physics.eyeHeight;
 
   if (physics.flyMode) {
     // Modo voo livre (espaço/ctrl)
@@ -699,8 +805,16 @@ function loop() {
     physics.velY += physics.gravity * dt;
     player.pos.y += physics.velY * dt;
 
-    if (player.pos.y <= groundY) {
+    const gap = player.pos.y - groundY;
+    if (gap <= 0) {
+      // Abaixo do chão: snap duro — nunca atravessa o terreno
       player.pos.y = groundY;
+      physics.velY = 0;
+      physics.onGround = true;
+    } else if (gap < 2.0 && physics.velY <= 0) {
+      // Snap suave: absorve divergência float32 (GPU) vs float64 (JS) sem o
+      // player flutuar. Corrige até 2u de gap com decaimento exponencial.
+      player.pos.y -= gap * Math.min(1.0, 10.0 * dt);
       physics.velY = 0;
       physics.onGround = true;
     } else {
@@ -712,6 +826,9 @@ function loop() {
       physics.onGround = false;
     }
   }
+
+  // Colisão com objetos (torres/monólitos/ruínas)
+  applyObjectCollisions(player.pos, style);
 
   uniforms.u_cameraPosition.value.copy(player.pos);
   uniforms.u_cameraDir.value.copy(getForward());
@@ -727,6 +844,11 @@ function loop() {
   const cx = Math.floor(player.pos.x / chunkSize);
   const cz = Math.floor(player.pos.z / chunkSize);
   document.getElementById('chunkTxt').textContent = `${cx}, ${cz}`;
+  const dbgEl = document.getElementById('dbgLine');
+  if (dbgEl.style.display !== 'none') {
+    document.getElementById('groundTxt').textContent = groundY.toFixed(2);
+    document.getElementById('gapTxt').textContent = (player.pos.y - groundY).toFixed(3);
+  }
 
   fpsCount++; fpsT += dt;
   if (fpsT >= 0.5) {
@@ -747,7 +869,8 @@ addEventListener('resize', () => {
 connect();
 renderInventory();
 // Posiciona o player na altura correta do terreno antes de começar
-player.pos.y = terrainHeightJS(player.pos.x, player.pos.z, 0) + physics.eyeHeight;
+buildHeightmap(player.pos.x, player.pos.z, 0);
+player.pos.y = sampleHeightmap(player.pos.x, player.pos.z) + physics.eyeHeight;
 loop();
 </script>
 </body>
