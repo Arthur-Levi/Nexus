@@ -63,9 +63,9 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
   <div>Assets <span class="v">0 MB</span></div>
 </div>
 
-<div id="inv"><b>INVENTÁRIO</b><div id="invList">vazio</div><div style="margin-top:4px">Score: <b id="scoreTxt">0</b></div></div>
+<div id="inv"><b>INVENTÁRIO</b><div id="invList">vazio</div><div style="margin-top:4px">Score: <b id="scoreTxt">0</b></div><div style="margin-top:4px">HP: <b id="hpTxt">100</b></div></div>
 
-<div id="help">WASD mover · MOUSE olhar · ESPAÇO pular · V voar · CLICK travar/atirar · SHIFT correr</div>
+<div id="help">WASD mover · MOUSE olhar · ESPAÇO pular · V voar · CLICK travar/atirar · E saquear · SHIFT correr</div>
 
 <div id="panel">
   <h3>Fusão de Universos</h3>
@@ -104,7 +104,8 @@ const HMAP_RES  = 256;
 const HMAP_HALF = 64.0;   // ±64 world units cobertos
 const hmapData  = new Float32Array(HMAP_RES * HMAP_RES);
 const hmapCenter = { x: 0, z: 0 };
-let hmapStyle = -1;
+let hmapParams = null;     // params com que o heightmap atual foi gerado
+let hmapPresetIndex = -1;  // último preset usado pra decidir quando reconstruir
 let hmapNeedsRebuild = true;
 const hmapTexture = new THREE.DataTexture(
   hmapData, HMAP_RES, HMAP_RES, THREE.RedFormat, THREE.FloatType
@@ -112,19 +113,111 @@ const hmapTexture = new THREE.DataTexture(
 hmapTexture.minFilter = THREE.LinearFilter;
 hmapTexture.magFilter = THREE.LinearFilter;
 
+// ─── Objetos destruídos: máscara de células enviada ao shader ──
+// Cada estrutura ocupa uma célula inteira (cx,cz) da grade de 48u.
+// Destruir uma estrutura marca sua célula aqui; o shader e a colisão
+// em JS leem a mesma lista, então o objeto some do render E do mundo físico.
+const MAX_DESTROYED = 64;
+const destroyedCells = new Set(); // chave "cx,cz"
+
 const uniforms = {
   u_time:           { value: 0.0 },
   u_resolution:     { value: new THREE.Vector2(innerWidth, innerHeight) },
   u_cameraPosition: { value: new THREE.Vector3(0, 22, 0) },
   u_cameraDir:      { value: new THREE.Vector3(0, 0, -1) },
   u_far:            { value: 220.0 },
-  u_world_style:    { value: 0.0 },
-  u_prev_style:     { value: 0.0 },
   u_transition:        { value: 1.0 },
   u_heightmap:         { value: hmapTexture },
   u_heightmap_center:  { value: new THREE.Vector2(0, 0) },
   u_heightmap_half:    { value: HMAP_HALF },
+  u_destroyedCount:    { value: 0 },
+  u_destroyedCells:    { value: Array.from({ length: MAX_DESTROYED }, () => new THREE.Vector2(1e6, 1e6)) },
+  // Parâmetros do mundo — universos infinitos definidos por números, não por if(style)
+  u_terrainScale: { value: 0.016 },
+  u_peakHeight:   { value: 30.0 },
+  u_ridgeAmount:  { value: 0.9 },
+  u_craterAmount: { value: 0.0 },
+  u_colorLow:     { value: new THREE.Vector3(0.20, 0.32, 0.12) },
+  u_colorHigh:    { value: new THREE.Vector3(0.92, 0.93, 0.97) },
+  u_colorSlope:   { value: new THREE.Vector3(0.32, 0.28, 0.24) },
+  u_fogColor:     { value: new THREE.Vector3(0.10, 0.07, 0.16) },
+  u_sunColor:     { value: new THREE.Vector3(1.0, 0.92, 0.78) },
+  u_metalness:    { value: 0.25 },
+  u_objectType:   { value: 0.0 },
 };
+
+function syncDestroyedUniform() {
+  const arr = uniforms.u_destroyedCells.value;
+  let i = 0;
+  for (const key of destroyedCells) {
+    if (i >= MAX_DESTROYED) break;
+    const [cx, cz] = key.split(',').map(Number);
+    arr[i].set(cx, cz);
+    i++;
+  }
+  uniforms.u_destroyedCount.value = i;
+}
+function markCellDestroyed(cx, cz) {
+  const key = cx + ',' + cz;
+  if (destroyedCells.has(key)) return;
+  destroyedCells.add(key);
+  syncDestroyedUniform();
+}
+
+// ─── Presets de mundo — os 3 universos viram dados, não código ──
+// Cada preset é só um conjunto de números pros mesmos uniforms; no futuro
+// a IA gera um desses objetos a partir de um prompt do jogador, sem precisar
+// tocar no shader. terrainScale/peakHeight/ridgeAmount/craterAmount também
+// são lidos pela física (terrainHeightJS) — ver lerpParams/lerp abaixo.
+const WORLD_PRESETS = [
+  { // 0 — Fantasia Sombria: montanhas escarpadas, picos góticos
+    terrainScale: 0.016, peakHeight: 30, ridgeAmount: 0.9, craterAmount: 0,
+    colorLow: [0.20, 0.32, 0.12], colorHigh: [0.92, 0.93, 0.97], colorSlope: [0.32, 0.28, 0.24],
+    fogColor: [0.10, 0.07, 0.16], sunColor: [1.0, 0.92, 0.78], metalness: 0.25, objectType: 0,
+  },
+  { // 1 — Sci-Fi: terreno mais contido e liso, metal brilhante
+    terrainScale: 0.05, peakHeight: 6, ridgeAmount: 0.15, craterAmount: 0,
+    colorLow: [0.20, 0.45, 0.30], colorHigh: [0.85, 0.88, 0.92], colorSlope: [0.45, 0.40, 0.35],
+    fogColor: [0.16, 0.24, 0.34], sunColor: [1.0, 0.92, 0.78], metalness: 1.3, objectType: 1,
+  },
+  { // 2 — Pós-Apocalíptico: dunas baixas tomadas de crateras
+    terrainScale: 0.022, peakHeight: 5, ridgeAmount: 0.25, craterAmount: 7,
+    colorLow: [0.08, 0.0, 0.16], colorHigh: [0.6, 0.0, 0.7], colorSlope: [0.30, 0.15, 0.10],
+    fogColor: [0.34, 0.26, 0.16], sunColor: [1.0, 0.3, 0.9], metalness: 0.15, objectType: 2,
+  },
+];
+
+function lerpVec3(a, b, t) { return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t]; }
+function lerpParams(a, b, t) {
+  const lerp = (x, y) => x + (y - x) * t;
+  return {
+    terrainScale: lerp(a.terrainScale, b.terrainScale),
+    peakHeight: lerp(a.peakHeight, b.peakHeight),
+    ridgeAmount: lerp(a.ridgeAmount, b.ridgeAmount),
+    craterAmount: lerp(a.craterAmount, b.craterAmount),
+    colorLow: lerpVec3(a.colorLow, b.colorLow, t),
+    colorHigh: lerpVec3(a.colorHigh, b.colorHigh, t),
+    colorSlope: lerpVec3(a.colorSlope, b.colorSlope, t),
+    fogColor: lerpVec3(a.fogColor, b.fogColor, t),
+    sunColor: lerpVec3(a.sunColor, b.sunColor, t),
+    metalness: lerp(a.metalness, b.metalness),
+    // forma do objeto não dá pra misturar continuamente — troca na metade da transição
+    objectType: t < 0.5 ? a.objectType : b.objectType,
+  };
+}
+function syncWorldUniforms(p) {
+  uniforms.u_terrainScale.value = p.terrainScale;
+  uniforms.u_peakHeight.value = p.peakHeight;
+  uniforms.u_ridgeAmount.value = p.ridgeAmount;
+  uniforms.u_craterAmount.value = p.craterAmount;
+  uniforms.u_colorLow.value.set(...p.colorLow);
+  uniforms.u_colorHigh.value.set(...p.colorHigh);
+  uniforms.u_colorSlope.value.set(...p.colorSlope);
+  uniforms.u_fogColor.value.set(...p.fogColor);
+  uniforms.u_sunColor.value.set(...p.sunColor);
+  uniforms.u_metalness.value = p.metalness;
+  uniforms.u_objectType.value = p.objectType;
+}
 
 const vertexShader = `
   void main() { gl_Position = vec4(position, 1.0); }
@@ -138,12 +231,28 @@ const fragmentShader = `
   uniform vec3  u_cameraPosition;
   uniform vec3  u_cameraDir;
   uniform float u_far;
-  uniform float u_world_style;
-  uniform float u_prev_style;
   uniform float u_transition;
   uniform sampler2D u_heightmap;
   uniform vec2  u_heightmap_center;
   uniform float u_heightmap_half;
+  uniform vec2  u_destroyedCells[64];
+  uniform int   u_destroyedCount;
+
+  // ─── Parâmetros do mundo (universos infinitos) ──────────────
+  // Nenhum if(style) aqui: o mundo inteiro é descrito por estes números.
+  // A mesma função de altura (lida por estes uniforms) é espelhada em JS
+  // pra física — ver terrainHeightJS, que precisa receber os MESMOS valores.
+  uniform float u_terrainScale;
+  uniform float u_peakHeight;
+  uniform float u_ridgeAmount;
+  uniform float u_craterAmount;
+  uniform vec3  u_colorLow;
+  uniform vec3  u_colorHigh;
+  uniform vec3  u_colorSlope;
+  uniform vec3  u_fogColor;
+  uniform vec3  u_sunColor;
+  uniform float u_metalness;
+  uniform float u_objectType;
 
   const int   MAX_STEPS = 80;
   const float SURF_DIST = 0.03;
@@ -186,38 +295,36 @@ const fragmentShader = `
   }
 
   mat2 rot2(float a){ float c=cos(a),s=sin(a); return mat2(c,-s,s,c); }
-  vec3 sunCol_(float style){ return (style>1.5)?vec3(1.0,0.3,0.9):vec3(1.0,0.92,0.78); }
 
-  float terrainHeight(vec2 xz, float style){
-    if(style<0.5){
-      // ── MUNDO 0: FANTASIA SOMBRIA ──
-      // Montanhas escarpadas, vales profundos, picos góticos
-      float base=fbmTerrain(xz*0.016)*16.0;
-      float peaks=ridgedFbm(xz*0.014)*28.0;
-      float detail=fbmTerrain(xz*0.18)*1.6;
-      float m=smoothstep(0.25,0.75,fbmTerrain(xz*0.007));
-      return mix(base, base+peaks, m)+detail-8.0;
-    } else if(style<1.5){
-      // ── MUNDO 1: SCI-FI ──
-      // Platôs limpos, mesas geométricas, terreno tecnológico
-      vec2 grid=floor(xz*0.08)/0.08;
-      float plateau=fbmTerrain(grid*0.02)*12.0;
-      plateau=floor(plateau*0.5)/0.5; // terraços suaves
-      float ripple=sin(xz.x*0.1)*sin(xz.y*0.1)*0.6;
-      return plateau+ripple-3.0;
-    } else {
-      // ── MUNDO 2: PÓS-APOCALÍPTICO ──
-      // Terreno destruído, crateras, dunas irregulares
-      float dunes=fbmTerrain(xz*0.02)*14.0;
-      float craters=-ridgedFbm(xz*0.05)*6.0; // depressões
-      float rubble=fbmTerrain(xz*0.4)*2.2;
-      return dunes+craters+rubble-5.0;
+  bool cellDestroyed(vec2 cell){
+    for(int i=0;i<64;i++){
+      if(i>=u_destroyedCount) break;
+      if(abs(cell.x-u_destroyedCells[i].x)<0.5 && abs(cell.y-u_destroyedCells[i].y)<0.5) return true;
     }
+    return false;
   }
 
-  float objectSDF(vec3 q, float style){
-    if(style<0.5){
-      // ── FANTASIA: torre/pilar gótico com topo pontiagudo ──
+  // Altura do terreno — função única, sem if(style). terrainScale controla a
+  // frequência (montanha larga vs platô compacto); peakHeight é a amplitude
+  // máxima dos picos; ridgeAmount mistura entre pico suave (0) e cume afiado
+  // tipo ridged-noise (1); craterAmount esculpe depressões (crateras/buracos).
+  float terrainHeight(vec2 xz, float scale, float peakHeight, float ridgeAmount, float craterAmount){
+    vec2 sp=xz*scale;
+    float base=fbmTerrain(sp)*14.0;
+    float mask=smoothstep(0.25,0.75,fbmTerrain(sp*0.45)); // regiões onde os picos se concentram
+    float peakShape=mix(fbmTerrain(sp*0.9), ridgedFbm(sp*0.9), clamp(ridgeAmount,0.0,1.0));
+    float peaks=peakShape*peakHeight*mask;
+    float craters=-ridgedFbm(sp*3.0)*craterAmount;
+    float detail=fbmTerrain(xz*scale*11.0)*1.6;
+    return base+peaks+craters+detail-7.0;
+  }
+
+  // Forma do objeto — eixo independente do terreno (u_objectType escolhe a
+  // família de forma; não precisa ser float32==float64 exato como a altura,
+  // já que a colisão em JS usa um cilindro aproximado, não esta SDF exata).
+  float objectSDF(vec3 q, float objType){
+    if(objType<0.5){
+      // ── TORRE/PILAR GÓTICO com topo pontiagudo ──
       vec3 b=vec3(0.8,4.0,0.8);
       vec3 d=abs(q)-b;
       float tower=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
@@ -225,8 +332,8 @@ const fragmentShader = `
       vec3 tp=q-vec3(0.0,4.0,0.0);
       float cone=max(length(tp.xz)*0.7+tp.y-1.5, -tp.y-1.5);
       return min(tower, cone);
-    } else if(style<1.5){
-      // ── SCI-FI: monólito/antena tecnológica ──
+    } else if(objType<1.5){
+      // ── MONÓLITO/ANTENA TECNOLÓGICA ──
       vec3 b=vec3(0.5,3.5,0.5);
       vec3 d=abs(q)-b;
       float pillar=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
@@ -237,7 +344,7 @@ const fragmentShader = `
       ring=max(ring, abs(rp.y)-0.12);
       return min(pillar, ring);
     } else {
-      // ── PÓS-APOCALÍPTICO: ruína quebrada/inclinada ──
+      // ── RUÍNA QUEBRADA/INCLINADA ──
       q.xz=rot2(0.3)*q.xz; // inclinada
       vec3 b=vec3(1.0,2.5,0.6);
       vec3 d=abs(q)-b;
@@ -248,28 +355,25 @@ const fragmentShader = `
     }
   }
 
-  float mapStyle(vec3 p, float style){
+  // Sem branch de estilo nem mixagem entre dois mundos: durante uma transição
+  // de universo, é o JS que interpola os PARÂMETROS (ver lerpParams) e sobe
+  // um único conjunto de uniforms — o shader sempre avalia só um mundo.
+  float map(vec3 p){
     vec2 hUV=(p.xz-u_heightmap_center)/(u_heightmap_half*2.0)+0.5;
     bool inHmap=u_transition>=0.999&&hUV.x>=0.0&&hUV.x<=1.0&&hUV.y>=0.0&&hUV.y<=1.0;
-    float terrainH=inHmap?texture2D(u_heightmap,hUV).r:terrainHeight(p.xz,style);
+    float terrainH=inHmap?texture2D(u_heightmap,hUV).r:terrainHeight(p.xz,u_terrainScale,u_peakHeight,u_ridgeAmount,u_craterAmount);
     float ground=(p.y-terrainH)*0.6;
     vec3 q=p;
-    q.xz=mod(q.xz+24.0,48.0)-24.0;
-    // Centro real do bloco onde o objeto está (não o canto)
-    vec2 cellCenter=(floor(p.xz/48.0)+0.5)*48.0;
-    float baseY=terrainHeight(cellCenter, style)+2.0;
-    float obj=objectSDF(q-vec3(0.0,baseY,0.0), style);
-    return min(ground, obj);
-  }
-
-  float map(vec3 p){
-    // Otimização: quando não há transição, computa só um mundo (metade do custo)
-    if(u_transition >= 0.999){
-      return mapStyle(p, u_world_style);
+    q.xz=mod(q.xz,48.0)-24.0;
+    vec2 cellXZ=floor(p.xz/48.0);
+    float obj=1.0e5;
+    if(!cellDestroyed(cellXZ)){
+      // Centro real do bloco onde o objeto está (não o canto)
+      vec2 cellCenter=(cellXZ+0.5)*48.0;
+      float baseY=terrainHeight(cellCenter,u_terrainScale,u_peakHeight,u_ridgeAmount,u_craterAmount)+2.0;
+      obj=objectSDF(q-vec3(0.0,baseY,0.0), u_objectType);
     }
-    float a=mapStyle(p,u_prev_style);
-    float b=mapStyle(p,u_world_style);
-    return mix(a,b,u_transition);
+    return min(ground, obj);
   }
 
   vec3 calcNormal(vec3 p){
@@ -308,34 +412,16 @@ const fragmentShader = `
     return clamp(res,0.0,1.0);
   }
 
-  vec3 terrainColor(vec3 p, vec3 n, float style){
-    if(style<0.5){
-      float slope=1.0-n.y;
-      float alt=clamp(p.y*0.03+0.4,0.0,1.0);
-      vec3 rock=vec3(0.32,0.28,0.24);
-      vec3 rockDark=vec3(0.18,0.16,0.14);
-      vec3 grass=vec3(0.20,0.32,0.12);
-      vec3 dirt=vec3(0.36,0.26,0.16);
-      vec3 snow=vec3(0.92,0.93,0.97);
-      float grain=noise(p*2.5)*0.5+noise(p*8.0)*0.25;
-      rock=mix(rockDark,rock,grain);
-      float veg=smoothstep(0.55,0.25,slope)*smoothstep(0.6,0.2,alt);
-      vec3 col=mix(rock,grass,veg);
-      col=mix(col,dirt,smoothstep(0.2,0.5,slope)*(1.0-veg)*0.6);
-      col=mix(col,snow,smoothstep(0.75,0.95,alt)*smoothstep(0.6,0.2,slope));
-      return col;
-    } else if(style<1.5){
-      float alt=clamp(p.y*0.06+0.3,0.0,1.0);
-      vec3 c=vec3(0.3,0.55,0.25);
-      if(alt>0.55) c=vec3(0.5,0.42,0.3);
-      if(alt>0.8) c=vec3(0.9,0.92,0.95);
-      return c;
-    } else {
-      float alt=clamp(p.y*0.05+0.3,0.0,1.0);
-      vec3 c=mix(vec3(0.08,0.0,0.16),vec3(0.6,0.0,0.7),alt);
-      c+=vec3(0.0,0.6,0.9)*pow(alt,3.0);
-      return c;
-    }
+  // Cor do terreno — gradiente por altitude entre colorLow/colorHigh, com
+  // colorSlope revelado nas inclinações (efeito "rocha exposta" genérico).
+  vec3 terrainColor(vec3 p, vec3 n, vec3 colorLow, vec3 colorHigh, vec3 colorSlope){
+    float alt=clamp(p.y*0.04+0.4,0.0,1.0);
+    float slope=1.0-n.y;
+    float grain=noise(p*2.5)*0.5+noise(p*8.0)*0.25;
+    vec3 col=mix(colorLow,colorHigh,alt);
+    vec3 slopeCol=mix(colorSlope*0.65,colorSlope,grain);
+    col=mix(col,slopeCol,smoothstep(0.15,0.6,slope));
+    return col;
   }
 
   void main(){
@@ -354,20 +440,16 @@ const fragmentShader = `
     vec3 rd=normalize(uv.x*right+uv.y*up+fwd*1.3);
 
     float d=rayMarch(ro,rd);
-    float style=mix(u_prev_style,u_world_style,u_transition);
 
     vec3 sunDir=normalize(vec3(0.5,0.55,0.4));
-    // Névoa por mundo: fantasia roxa, sci-fi azul-aço, pós-apoc âmbar tóxico
-    vec3 fogColor;
-    if(style<0.5)      fogColor=vec3(0.10,0.07,0.16);
-    else if(style<1.5) fogColor=vec3(0.16,0.24,0.34);
-    else               fogColor=vec3(0.34,0.26,0.16);
+    vec3 fogColor=u_fogColor;
+    vec3 sunCol=u_sunColor;
     vec3 col;
 
     if(d<u_far){
       vec3 p=ro+rd*d;
       vec3 n=calcNormal(p);
-      vec3 albedo=terrainColor(p,n,style);
+      vec3 albedo=terrainColor(p,n,u_colorLow,u_colorHigh,u_colorSlope);
 
       float diff=clamp(dot(n,sunDir),0.0,1.0);
       // Sombra só nos objetos próximos (longe não compensa o custo)
@@ -380,12 +462,9 @@ const fragmentShader = `
       vec3 viewDir=normalize(ro-p);
       vec3 halfDir=normalize(sunDir+viewDir);
       float spec=pow(clamp(dot(n,halfDir),0.0,1.0),48.0);
-      // Sci-fi brilha (metal), fantasia fosca, pós-apoc opaco
-      float specMix=(style<0.5)?0.25:(style<1.5)?1.3:0.15;
 
-      vec3 sunCol=sunCol_(style);
       col=albedo*(skyAmb+sunCol*diff*1.1);
-      col+=sunCol*spec*specMix*sh;
+      col+=sunCol*spec*u_metalness*sh;
 
       float fres=pow(1.0-clamp(dot(n,viewDir),0.0,1.0),4.0);
       col+=fogColor*fres*0.3;
@@ -396,16 +475,14 @@ const fragmentShader = `
       col=mix(col,fogTinted,fog);
     } else {
       float grad=clamp(rd.y*0.5+0.5,0.0,1.0);
-      vec3 skyTop;
-      if(style<0.5)      skyTop=vec3(0.06,0.03,0.14); // fantasia: noite roxa
-      else if(style<1.5) skyTop=vec3(0.08,0.16,0.32); // sci-fi: azul profundo
-      else               skyTop=vec3(0.22,0.14,0.10); // pós-apoc: céu de fumaça
+      vec3 skyTop=fogColor*0.5; // zênite genérico: escurece a cor da névoa
       col=mix(fogColor,skyTop,pow(grad,0.8));
       float sun=clamp(dot(rd,sunDir),0.0,1.0);
-      col+=sunCol_(style)*pow(sun,256.0)*2.0;
-      col+=sunCol_(style)*pow(sun,8.0)*0.3;
-      // estrelas na fantasia e sci-fi (céu limpo); pós-apoc tem fumaça
-      if(style<1.5){
+      col+=sunCol*pow(sun,256.0)*2.0;
+      col+=sunCol*pow(sun,8.0)*0.3;
+      // céu limpo (pouca cratera) mostra estrelas; mundo muito cheio de
+      // crateras/destruição (fumaça) não mostra — reusa craterAmount
+      if(u_craterAmount<3.0){
         float st=step(0.9985,hash(floor(rd*60.0)));
         col+=vec3(st)*0.7;
       }
@@ -441,11 +518,11 @@ function noise2(x, y) {
 }
 function fbmTerrain(x, y) {
   let v = 0, a = 0.5;
-  // matriz de rotação fixa (mesmos coef. do shader: 1.6,1.2,-1.2,1.6)
+  // matriz de rotação fixa (mesmos coef. do shader: mat2(1.6,1.2,-1.2,1.6) em column-major)
   for (let i = 0; i < 6; i++) {
     v += a * noise2(x, y);
-    const nx = 1.6 * x + 1.2 * y;
-    const ny = -1.2 * x + 1.6 * y;
+    const nx = 1.6 * x - 1.2 * y;
+    const ny = 1.2 * x + 1.6 * y;
     x = nx; y = ny;
     a *= 0.5;
   }
@@ -458,8 +535,8 @@ function ridgedFbm(x, y) {
     n = 1 - Math.abs(n * 2 - 1);
     n = n * n;
     v += a * n;
-    const nx = 1.6 * x + 1.2 * y;
-    const ny = -1.2 * x + 1.6 * y;
+    const nx = 1.6 * x - 1.2 * y;
+    const ny = 1.2 * x + 1.6 * y;
     x = nx; y = ny;
     a *= 0.5;
   }
@@ -469,42 +546,33 @@ function smoothstep(e0, e1, x) {
   const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
   return t * t * (3 - 2 * t);
 }
-function terrainHeightJS(x, z, style) {
-  if (style < 0.5) {
-    // Fantasia Sombria
-    const base = fbmTerrain(x * 0.016, z * 0.016) * 16;
-    const peaks = ridgedFbm(x * 0.014, z * 0.014) * 28;
-    const detail = fbmTerrain(x * 0.18, z * 0.18) * 1.6;
-    const m = smoothstep(0.25, 0.75, fbmTerrain(x * 0.007, z * 0.007));
-    return base + (peaks * m) + detail - 8;
-  } else if (style < 1.5) {
-    // Sci-Fi
-    const gx = Math.floor(x * 0.08) / 0.08;
-    const gz = Math.floor(z * 0.08) / 0.08;
-    let plateau = fbmTerrain(gx * 0.02, gz * 0.02) * 12;
-    plateau = Math.floor(plateau * 0.5) / 0.5;
-    const ripple = Math.sin(x * 0.1) * Math.sin(z * 0.1) * 0.6;
-    return plateau + ripple - 3;
-  } else {
-    // Pós-Apocalíptico
-    const dunes = fbmTerrain(x * 0.02, z * 0.02) * 14;
-    const craters = -ridgedFbm(x * 0.05, z * 0.05) * 6;
-    const rubble = fbmTerrain(x * 0.4, z * 0.4) * 2.2;
-    return dunes + craters + rubble - 5;
-  }
+// Espelha terrainHeight() do GLSL bit-a-bit (mesmas constantes, mesma ordem
+// de operações) lendo os mesmos 4 parâmetros — sem isso, física e render
+// voltam a divergir (era exatamente o bug original do projeto).
+function terrainHeightJS(x, z, params) {
+  const scale = params.terrainScale;
+  const sx = x * scale, sz = z * scale;
+  const base = fbmTerrain(sx, sz) * 14;
+  const mask = smoothstep(0.25, 0.75, fbmTerrain(sx * 0.45, sz * 0.45));
+  const ridgeAmount = Math.max(0, Math.min(1, params.ridgeAmount));
+  const peakShape = fbmTerrain(sx * 0.9, sz * 0.9) * (1 - ridgeAmount) + ridgedFbm(sx * 0.9, sz * 0.9) * ridgeAmount;
+  const peaks = peakShape * params.peakHeight * mask;
+  const craters = -ridgedFbm(sx * 3.0, sz * 3.0) * params.craterAmount;
+  const detail = fbmTerrain(x * scale * 11.0, z * scale * 11.0) * 1.6;
+  return base + peaks + craters + detail - 7;
 }
 
-function buildHeightmap(cx, cz, style) {
+function buildHeightmap(cx, cz, params) {
   const step = (HMAP_HALF * 2) / HMAP_RES;
   const ox = cx - HMAP_HALF, oz = cz - HMAP_HALF;
   for (let j = 0; j < HMAP_RES; j++) {
     for (let i = 0; i < HMAP_RES; i++) {
       hmapData[j * HMAP_RES + i] = terrainHeightJS(
-        ox + (i + 0.5) * step, oz + (j + 0.5) * step, style
+        ox + (i + 0.5) * step, oz + (j + 0.5) * step, params
       );
     }
   }
-  hmapCenter.x = cx; hmapCenter.z = cz; hmapStyle = style;
+  hmapCenter.x = cx; hmapCenter.z = cz; hmapParams = params; hmapPresetIndex = currentPresetIndex;
   hmapTexture.needsUpdate = true;
   uniforms.u_heightmap_center.value.set(cx, cz);
 }
@@ -512,7 +580,7 @@ function sampleHeightmap(x, z) {
   const ux = (x - hmapCenter.x) / (HMAP_HALF * 2) + 0.5;
   const uz = (z - hmapCenter.z) / (HMAP_HALF * 2) + 0.5;
   if (ux < 0 || ux > 1 || uz < 0 || uz > 1)
-    return terrainHeightJS(x, z, hmapStyle);
+    return terrainHeightJS(x, z, hmapParams);
   const px = ux * HMAP_RES - 0.5, pz = uz * HMAP_RES - 0.5;
   const ix = Math.max(0, Math.min(HMAP_RES - 2, Math.floor(px)));
   const iz = Math.max(0, Math.min(HMAP_RES - 2, Math.floor(pz)));
@@ -527,24 +595,39 @@ function sampleHeightmap(x, z) {
 // Cada célula tem exatamente um objeto no centro; checamos 3×3 células vizinhas.
 const OBJ_CELL = 48.0;
 const PLAYER_RADIUS = 0.4;
-const OBJ_CONFIGS = [
-  { radius: 1.1, bottom: -4.0, top: 6.0  }, // Fantasia: torre gótica
-  { radius: 0.8, bottom: -3.5, top: 4.0  }, // Sci-Fi: monólito/antena
-  { radius: 1.3, bottom: -2.5, top: 3.5  }, // Pós-Apoc: ruína inclinada (maior raio para compensar a rotação)
+// Geometria de colisão por u_objectType — eixo independente do terreno,
+// por isso fica fora de WORLD_PRESETS (cada preset só referencia um índice).
+const OBJECT_TYPE_CONFIGS = [
+  { radius: 1.1, bottom: -4.0, top: 6.0  }, // 0: torre gótica
+  { radius: 0.8, bottom: -3.5, top: 4.0  }, // 1: monólito/antena
+  { radius: 1.3, bottom: -2.5, top: 3.5  }, // 2: ruína inclinada (maior raio para compensar a rotação)
 ];
 
-function applyObjectCollisions(pos, style) {
-  const cfg = OBJ_CONFIGS[Math.round(style)] || OBJ_CONFIGS[0];
+function structureId(cx, cz) {
+  return 'struct_' + cx + '_' + cz;
+}
+function parseStructureId(oid) {
+  const m = /^struct_(-?\d+)_(-?\d+)$/.exec(oid);
+  return m ? { cx: parseInt(m[1], 10), cz: parseInt(m[2], 10) } : null;
+}
+
+// Retorna o id da estrutura tocada neste frame (ou null) — usado pra
+// disparar o COLLIDE de dano sem precisar reconsultar a colisão depois.
+function applyObjectCollisions(pos, objectType) {
+  const cfg = OBJECT_TYPE_CONFIGS[Math.round(objectType)] || OBJECT_TYPE_CONFIGS[0];
   const minDist = cfg.radius + PLAYER_RADIUS;
   const minDist2 = minDist * minDist;
   const playerFeet = pos.y - physics.eyeHeight;
   const playerHead = pos.y + 0.3;
   const cx = Math.floor(pos.x / OBJ_CELL);
   const cz = Math.floor(pos.z / OBJ_CELL);
+  let hitStructure = null;
   for (let di = -1; di <= 1; di++) {
     for (let dj = -1; dj <= 1; dj++) {
-      const ox = (cx + di + 0.5) * OBJ_CELL;
-      const oz = (cz + dj + 0.5) * OBJ_CELL;
+      const cellCx = cx + di, cellCz = cz + dj;
+      if (destroyedCells.has(cellCx + ',' + cellCz)) continue;
+      const ox = (cellCx + 0.5) * OBJ_CELL;
+      const oz = (cellCz + 0.5) * OBJ_CELL;
       // baseY: mesmo cálculo do shader (terrainHeight(cellCenter) + 2)
       const baseY = sampleHeightmap(ox, oz) + 2.0;
       // Descarta se o player está acima ou abaixo do objeto
@@ -557,8 +640,30 @@ function applyObjectCollisions(pos, style) {
       const push = minDist - dist;
       pos.x += (dx / dist) * push;
       pos.z += (dz / dist) * push;
+      hitStructure = structureId(cellCx, cellCz);
     }
   }
+  return hitStructure;
+}
+
+// Raycast simplificado contra o cilindro aproximado da estrutura (mesma
+// aproximação já usada na colisão). Usado pelo SHOOT pra acertar de fato
+// o que está sendo visualmente apontado, em vez de um id arbitrário.
+function raycastStructure(ro, rd, maxDist) {
+  const cfg = OBJECT_TYPE_CONFIGS[Math.round(uniforms.u_objectType.value)] || OBJECT_TYPE_CONFIGS[0];
+  for (let t = 1.0; t < maxDist; t += 1.0) {
+    const px = ro.x + rd.x * t, py = ro.y + rd.y * t, pz = ro.z + rd.z * t;
+    const cellCx = Math.floor(px / OBJ_CELL), cellCz = Math.floor(pz / OBJ_CELL);
+    if (destroyedCells.has(cellCx + ',' + cellCz)) continue;
+    const ox = (cellCx + 0.5) * OBJ_CELL, oz = (cellCz + 0.5) * OBJ_CELL;
+    const baseY = sampleHeightmap(ox, oz) + 2.0;
+    if (py < baseY + cfg.bottom || py > baseY + cfg.top) continue;
+    const dx = px - ox, dz = pz - oz;
+    if (dx * dx + dz * dz <= cfg.radius * cfg.radius) {
+      return { cx: cellCx, cz: cellCz };
+    }
+  }
+  return null;
 }
 
 // ─── Estado físico do player ────────────────────────────────
@@ -570,6 +675,10 @@ const physics = {
   eyeHeight: 2.5,   // altura dos olhos acima do chão
   flyMode: false,   // alterna com tecla V
 };
+// Estruturas vivas são hostis ao toque: dano com cooldown (evita -15hp/frame)
+const HIT_COOLDOWN = 0.8;
+let lastHitTime = -Infinity;
+const LOOT_RADIUS = 4.0; // raio pra saquear destroços de uma estrutura destruída
 const player = { pos: new THREE.Vector3(0, 22, 0), yaw: 0, pitch: -0.15 };
 const keys = {};
 let pointerLocked = false;
@@ -585,6 +694,7 @@ addEventListener('keydown', e => {
     const dl = document.getElementById('dbgLine');
     dl.style.display = dl.style.display === 'none' ? '' : 'none';
   }
+  if (e.code === 'KeyE') tryLoot();
 });
 addEventListener('keyup',   e => { keys[e.code] = false; });
 
@@ -611,13 +721,20 @@ function getForward() {
 }
 
 // ─── Transição de estilo ────────────────────────────────────
+// "Estilo" aqui é só qual preset está selecionado na UI/backend (0,1,2);
+// o que de fato anima é a interpolação dos PARÂMETROS (lerpParams), não
+// mais um índice lido pelo shader — ver loop() e syncWorldUniforms.
 const styleTransition = { active: false, t: 1.0, duration: 1.5 };
 const STYLE_NAMES = ['Fantasia Sombria', 'Sci-Fi', 'Pós-Apocalíptico'];
+let currentPresetIndex = 0;
+let prevParams = WORLD_PRESETS[0];
+let currParams = WORLD_PRESETS[0];
 
 function changeStyle(newStyle) {
-  if (newStyle === uniforms.u_world_style.value) return;
-  uniforms.u_prev_style.value = uniforms.u_world_style.value;
-  uniforms.u_world_style.value = newStyle;
+  if (newStyle === currentPresetIndex) return;
+  prevParams = currParams;
+  currParams = WORLD_PRESETS[newStyle];
+  currentPresetIndex = newStyle;
   uniforms.u_transition.value = 0.0;
   styleTransition.active = true;
   styleTransition.t = 0.0;
@@ -629,8 +746,17 @@ function changeStyle(newStyle) {
 // ─── WebSocket ──────────────────────────────────────────────
 const PLAYER_ID = 'player_' + Math.random().toString(36).slice(2, 8);
 let ws = null, reconnDelay = 1000, reconnTimer = null;
-let inventory = {}, score = 0, chunkSize = 16;
+let inventory = {}, score = 0, health = 100, chunkSize = 16;
 const localModified = new Set();
+
+// Registra um id já resolvido pelo servidor; se for uma estrutura (não um
+// "_loot" de saque), também marca a célula como destruída pro shader e pra
+// colisão pararem de desenhar/bloquear o objeto.
+function registerModified(oid) {
+  localModified.add(oid);
+  const parsed = parseStructureId(oid);
+  if (parsed) markCellDestroyed(parsed.cx, parsed.cz);
+}
 
 function wsUrl() {
   const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -675,11 +801,11 @@ function onServerMsg(d) {
       break;
     case 'DESTROYED':
       triggerExplosion();
-      if (d.target_id) localModified.add(d.target_id);
+      if (d.target_id) registerModified(d.target_id);
       if (d.player_state) applyState(d.player_state);
       break;
     case 'COLLECTED':
-      if (d.target_id) localModified.add(d.target_id);
+      if (d.target_id) registerModified(d.target_id);
       if (d.player_state) applyState(d.player_state);
       break;
     case 'PLAYER_HIT':
@@ -688,7 +814,7 @@ function onServerMsg(d) {
       break;
     case 'CHUNK_RECONCILE':
       if (d.modified) {
-        Object.keys(d.modified).forEach(oid => localModified.add(oid));
+        Object.keys(d.modified).forEach(oid => registerModified(oid));
         showToast('Mundo reconciliado · chunk ' + d.chunk.join(','));
       }
       break;
@@ -698,6 +824,7 @@ function onServerMsg(d) {
 function applyState(s) {
   if (s.inventory) inventory = s.inventory;
   if (typeof s.score === 'number') score = s.score;
+  if (typeof s.health === 'number') health = s.health;
   renderInventory();
 }
 function renderInventory() {
@@ -705,12 +832,34 @@ function renderInventory() {
   const items = Object.entries(inventory);
   list.innerHTML = items.length ? items.map(([k,v]) => `${k}: <b>${v}</b>`).join('<br>') : 'vazio';
   document.getElementById('scoreTxt').textContent = score;
+  document.getElementById('hpTxt').textContent = health;
 }
 
 function shoot() {
-  const oid = 'orb_' + Math.floor(player.pos.x) + '_' + Math.floor(player.pos.z);
-  if (localModified.has(oid)) return;
+  const hit = raycastStructure(player.pos, getForward(), 80);
+  if (!hit) { showToast('Sem alvo'); return; }
+  const oid = structureId(hit.cx, hit.cz);
+  if (localModified.has(oid)) { showToast('Já destruído'); return; }
   sendAction({ action_type: 'SHOOT', target_id: oid, target_tags: ['destruivel', 'hostil'] });
+}
+
+// Saqueia destroços de uma estrutura já destruída perto do player (tecla E)
+function tryLoot() {
+  const cx = Math.floor(player.pos.x / OBJ_CELL), cz = Math.floor(player.pos.z / OBJ_CELL);
+  for (let di = -1; di <= 1; di++) {
+    for (let dj = -1; dj <= 1; dj++) {
+      const cellCx = cx + di, cellCz = cz + dj;
+      if (!destroyedCells.has(cellCx + ',' + cellCz)) continue;
+      const ox = (cellCx + 0.5) * OBJ_CELL, oz = (cellCz + 0.5) * OBJ_CELL;
+      const dx = player.pos.x - ox, dz = player.pos.z - oz;
+      if (dx * dx + dz * dz > LOOT_RADIUS * LOOT_RADIUS) continue;
+      const lootId = structureId(cellCx, cellCz) + '_loot';
+      if (localModified.has(lootId)) continue;
+      sendAction({ action_type: 'INTERACT', target_id: lootId, target_tags: ['coletavel', 'sucata'] });
+      return;
+    }
+  }
+  showToast('Nada pra saquear aqui');
 }
 
 // ─── Efeitos ────────────────────────────────────────────────
@@ -762,17 +911,25 @@ function loop() {
   const dt = Math.min(clock.getDelta(), 0.05);
   uniforms.u_time.value += dt;
 
+  // liveParams é o conjunto efetivamente em uso neste frame — durante uma
+  // transição, é a interpolação contínua entre o mundo antigo e o novo
+  // (substitui a antiga mixagem de duas SDFs dentro do shader: agora o
+  // shader sempre avalia um único mundo, e quem anima é o JS).
+  let liveParams = currParams;
   if (styleTransition.active) {
     styleTransition.t += dt / styleTransition.duration;
     if (styleTransition.t >= 1.0) {
       styleTransition.t = 1.0;
       styleTransition.active = false;
-      uniforms.u_prev_style.value = uniforms.u_world_style.value;
-      hmapNeedsRebuild = true; // regenera heightmap para o novo estilo
+      prevParams = currParams;
+      hmapNeedsRebuild = true; // regenera heightmap para o novo preset
     }
     const e = styleTransition.t;
-    uniforms.u_transition.value = e * e * (3.0 - 2.0 * e);
+    const eased = e * e * (3.0 - 2.0 * e);
+    uniforms.u_transition.value = eased;
+    liveParams = lerpParams(prevParams, currParams, eased);
   }
+  syncWorldUniforms(liveParams);
 
   const speed = (keys['ShiftLeft'] ? 22 : 12) * dt;
   const fwd = getForward();
@@ -783,15 +940,14 @@ function loop() {
   if (keys['KeyA']) player.pos.addScaledVector(right, speed);
   if (keys['KeyD']) player.pos.addScaledVector(right, -speed);
 
-  const style = uniforms.u_world_style.value;
   if (!styleTransition.active) {
     const dx = player.pos.x - hmapCenter.x, dz = player.pos.z - hmapCenter.z;
-    if (hmapNeedsRebuild || dx * dx + dz * dz > 32 * 32 || style !== hmapStyle)
-      buildHeightmap(player.pos.x, player.pos.z, style);
+    if (hmapNeedsRebuild || dx * dx + dz * dz > 32 * 32 || currentPresetIndex !== hmapPresetIndex)
+      buildHeightmap(player.pos.x, player.pos.z, currParams);
     hmapNeedsRebuild = false;
   }
   const groundY = (styleTransition.active
-    ? terrainHeightJS(player.pos.x, player.pos.z, style)
+    ? terrainHeightJS(player.pos.x, player.pos.z, liveParams)
     : sampleHeightmap(player.pos.x, player.pos.z)) + physics.eyeHeight;
 
   if (physics.flyMode) {
@@ -827,8 +983,16 @@ function loop() {
     }
   }
 
-  // Colisão com objetos (torres/monólitos/ruínas)
-  applyObjectCollisions(player.pos, style);
+  // Colisão com objetos (torres/monólitos/ruínas) — enquanto vivas, são
+  // hostis ao toque: dano com cooldown pra não ser instakill em contato contínuo.
+  const hitStructure = applyObjectCollisions(player.pos, liveParams.objectType);
+  if (hitStructure) {
+    const now = clock.elapsedTime;
+    if (now - lastHitTime > HIT_COOLDOWN) {
+      lastHitTime = now;
+      sendAction({ action_type: 'COLLIDE', target_id: hitStructure, target_tags: ['hostil', 'solido'] });
+    }
+  }
 
   uniforms.u_cameraPosition.value.copy(player.pos);
   uniforms.u_cameraDir.value.copy(getForward());
@@ -868,8 +1032,9 @@ addEventListener('resize', () => {
 
 connect();
 renderInventory();
+syncWorldUniforms(currParams);
 // Posiciona o player na altura correta do terreno antes de começar
-buildHeightmap(player.pos.x, player.pos.z, 0);
+buildHeightmap(player.pos.x, player.pos.z, currParams);
 player.pos.y = sampleHeightmap(player.pos.x, player.pos.z) + physics.eyeHeight;
 loop();
 </script>

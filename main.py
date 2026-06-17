@@ -194,7 +194,7 @@ class PlayerState:
         self.health = 100
         self.score = 0
         self.world_style = 0
-        self.current_chunk: tuple[int, int] = (0, 0)
+        self.current_chunk: Optional[tuple[int, int]] = None
         self.destroyed_objects: set[str] = set()
 
     def snapshot(self) -> dict:
@@ -232,14 +232,17 @@ class SemanticEngine:
         if atype == "SHOOT" and "destruivel" in tags:
             state.destroyed_objects.add(oid)
             state.score += 10
+            bonus = None
+            if "hostil" in tags:
+                state.score += 25
+                bonus = "HOSTILE_ELIMINATED"
             result.update({
                 "status": "DESTROYED",
                 "visual_trigger": "EXPLODE_PARTICLES",
                 "player_state": state.snapshot(),
             })
-            if "hostil" in tags:
-                state.score += 25
-                result["bonus"] = "HOSTILE_ELIMINATED"
+            if bonus:
+                result["bonus"] = bonus
             chunk_mod = {"obj_id": oid, "state": {"status": "destroyed"}}
             return result, chunk_mod
 
