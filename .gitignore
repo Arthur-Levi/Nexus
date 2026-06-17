@@ -1,0 +1,17 @@
+# Banco de dados local (não deve ir pro repositório)
+nexus_world.db
+nexus_world.db-journal
+nexus_world.db-wal
+nexus_world.db-shm
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Variáveis de ambiente / segredos
+.env
+
+# Sistema
+.DS_Store
