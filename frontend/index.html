@@ -578,6 +578,42 @@ function buildHeightmap(cx, cz, params) {
   hmapTexture.needsUpdate = true;
   uniforms.u_heightmap_center.value.set(cx, cz);
 }
+// Rebuild incremental: o primeiro buildHeightmap() (bootstrap, antes do jogo
+// começar a rodar) continua síncrono — não tem nada pra travar ainda. Mas
+// rebuilds DURANTE o jogo (gatilho: andar 32u) faziam ~65536 avaliações de
+// fbm de uma vez (~180ms+ de thread principal bloqueada, medido), o que
+// gerava engasgos visíveis e, em conexões via túnel (Codespaces), chegava a
+// derrubar o WebSocket (o congelamento parecia conexão morta). A correção:
+// computa num buffer de rascunho, poucas linhas por frame; só troca o
+// hmapData (lido por física/colisão/shader) quando o rascunho está 100%
+// completo — nunca existe heightmap "pela metade" visível pro resto do jogo.
+let hmapBuild = null;
+const HMAP_ROWS_PER_FRAME = 8; // espalha as ~65536 avaliações em ~32 frames
+
+function startHeightmapBuild(cx, cz, params) {
+  hmapBuild = { cx, cz, params, presetIndex: currentPresetIndex, buf: new Float32Array(HMAP_RES * HMAP_RES), row: 0 };
+}
+function stepHeightmapBuild() {
+  if (!hmapBuild) return;
+  const { cx, cz, params, buf } = hmapBuild;
+  const step = (HMAP_HALF * 2) / HMAP_RES;
+  const ox = cx - HMAP_HALF, oz = cz - HMAP_HALF;
+  const rowsThisFrame = Math.min(HMAP_ROWS_PER_FRAME, HMAP_RES - hmapBuild.row);
+  for (let r = 0; r < rowsThisFrame; r++) {
+    const j = hmapBuild.row + r;
+    for (let i = 0; i < HMAP_RES; i++) {
+      buf[j * HMAP_RES + i] = terrainHeightJS(ox + (i + 0.5) * step, oz + (j + 0.5) * step, params);
+    }
+  }
+  hmapBuild.row += rowsThisFrame;
+  if (hmapBuild.row >= HMAP_RES) {
+    hmapData.set(buf);
+    hmapCenter.x = cx; hmapCenter.z = cz; hmapParams = params; hmapPresetIndex = hmapBuild.presetIndex;
+    hmapTexture.needsUpdate = true;
+    uniforms.u_heightmap_center.value.set(cx, cz);
+    hmapBuild = null;
+  }
+}
 function sampleHeightmap(x, z) {
   const ux = (x - hmapCenter.x) / (HMAP_HALF * 2) + 0.5;
   const uz = (z - hmapCenter.z) / (HMAP_HALF * 2) + 0.5;
@@ -997,10 +1033,15 @@ function loop() {
 
   if (!styleTransition.active) {
     const dx = player.pos.x - hmapCenter.x, dz = player.pos.z - hmapCenter.z;
-    if (hmapNeedsRebuild || dx * dx + dz * dz > 32 * 32 || currentPresetIndex !== hmapPresetIndex)
-      buildHeightmap(player.pos.x, player.pos.z, currParams);
+    const wantsRebuild = hmapNeedsRebuild || dx * dx + dz * dz > 32 * 32 || currentPresetIndex !== hmapPresetIndex;
+    // Não reinicia um build já em andamento pro mesmo preset (deixa terminar);
+    // só substitui se o preset mudou (ex: transição terminou no meio de um build antigo).
+    if (wantsRebuild && (!hmapBuild || hmapBuild.presetIndex !== currentPresetIndex)) {
+      startHeightmapBuild(player.pos.x, player.pos.z, currParams);
+    }
     hmapNeedsRebuild = false;
   }
+  stepHeightmapBuild();
   const groundY = (styleTransition.active
     ? terrainHeightJS(player.pos.x, player.pos.z, liveParams)
     : sampleHeightmap(player.pos.x, player.pos.z)) + physics.eyeHeight;
