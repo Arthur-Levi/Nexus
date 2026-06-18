@@ -834,13 +834,22 @@ let ws = null, reconnDelay = 1000, reconnTimer = null;
 let inventory = {}, score = 0, health = 100, chunkSize = 16;
 const localModified = new Set();
 
-// Registra um id já resolvido pelo servidor; se for uma estrutura (não um
-// "_loot" de saque), também marca a célula como destruída pro shader e pra
-// colisão pararem de desenhar/bloquear o objeto.
-function registerModified(oid) {
+// Aplica um estado persistido (vindo do servidor) ao mundo local — o
+// `status` real decide o efeito explicitamente; parseStructureId só
+// extrai cx/cz de um id de estrutura, nunca "adivinha" o que aconteceu
+// a partir do formato do id (era assim antes: qualquer id que batesse o
+// padrão struct_X_Z era tratado como destruído, mesmo vindo de um status
+// diferente — agora cada status decide seu próprio efeito).
+function applyPersistedState(oid, state) {
   localModified.add(oid);
-  const parsed = parseStructureId(oid);
-  if (parsed) markCellDestroyed(parsed.cx, parsed.cz);
+  const status = state && state.status;
+  if (status === 'destroyed') {
+    const parsed = parseStructureId(oid);
+    if (parsed) markCellDestroyed(parsed.cx, parsed.cz);
+  }
+  // 'collected' e qualquer status futuro (ex: 'modified'): por ora o
+  // registro em localModified acima já é o efeito completo — sem mudança
+  // visual ou de colisão associada ainda.
 }
 
 function wsUrl() {
@@ -886,11 +895,11 @@ function onServerMsg(d) {
       break;
     case 'DESTROYED':
       triggerExplosion();
-      if (d.target_id) registerModified(d.target_id);
+      if (d.target_id) applyPersistedState(d.target_id, { status: 'destroyed' });
       if (d.player_state) applyState(d.player_state);
       break;
     case 'COLLECTED':
-      if (d.target_id) registerModified(d.target_id);
+      if (d.target_id) applyPersistedState(d.target_id, { status: 'collected' });
       if (d.player_state) applyState(d.player_state);
       break;
     case 'PLAYER_HIT':
@@ -899,9 +908,15 @@ function onServerMsg(d) {
       break;
     case 'CHUNK_RECONCILE':
       if (d.modified) {
-        Object.keys(d.modified).forEach(oid => registerModified(oid));
+        Object.entries(d.modified).forEach(([oid, state]) => applyPersistedState(oid, state));
         showToast('Mundo reconciliado · chunk ' + d.chunk.join(','));
       }
+      break;
+    case 'ALREADY_RESOLVED':
+      // Servidor já tinha esse objeto resolvido globalmente (outro jogador,
+      // ou de antes de um restart) — converge o estado local em vez de
+      // deixar a estrutura "tiroteável" pra sempre sem nunca cair.
+      if (d.target_id && d.resolved_state) applyPersistedState(d.target_id, d.resolved_state);
       break;
     default: break;
   }

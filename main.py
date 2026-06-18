@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 import aiosqlite
 import asyncio
 import json
+import re
 import time
 
 @asynccontextmanager
@@ -44,6 +45,7 @@ RATE_LIMIT_MAX = 300
 RATE_LIMIT_WINDOW = 10
 FRONTEND_PATH = "frontend/index.html"
 CHUNK_SIZE = 16.0   # unidades por chunk (malha 2D no plano XZ)
+OBJ_CELL = 48.0      # tamanho da célula de estrutura — mesmo valor de OBJ_CELL no frontend
 DB_PATH = "nexus_world.db"
 
 rate_store: dict[str, list[float]] = defaultdict(list)
@@ -98,6 +100,30 @@ def chunk_coords(x: float, z: float) -> tuple[int, int]:
     return (int(x // CHUNK_SIZE), int(z // CHUNK_SIZE))
 
 
+# Casa "struct_<cx>_<cz>" e também "struct_<cx>_<cz>_loot" (sufixo de saque) —
+# ambos pertencem à mesma estrutura física, então devem cair no(s) mesmo(s) chunk(s).
+STRUCT_ID_RE = re.compile(r"^struct_(-?\d+)_(-?\d+)")
+
+
+def object_home_chunks(obj_id: str) -> list[tuple[int, int]]:
+    """Todos os chunks (16u) cobertos pela célula de 48u de uma estrutura,
+    derivados do PRÓPRIO id — não de onde o jogador estava ao agir sobre ela.
+    OBJ_CELL é múltiplo exato de CHUNK_SIZE (48 = 3×16), então isso sempre
+    resulta numa grade 3×3 de chunks. Sem isso, a mesma estrutura podia ser
+    "lembrada" em chunks diferentes dependendo de onde o tiro partiu, e voltar
+    por outro lado da estrutura não reconciliava (objeto reaparecia).
+    Retorna lista vazia se o id não seguir esse formato (chamador decide o
+    fallback, ex: chunk atual do jogador)."""
+    m = STRUCT_ID_RE.match(obj_id)
+    if not m:
+        return []
+    ocx, ocz = int(m.group(1)), int(m.group(2))
+    x0, z0 = ocx * OBJ_CELL, ocz * OBJ_CELL
+    cx0, cz0 = chunk_coords(x0, z0)
+    cx1, cz1 = chunk_coords(x0 + OBJ_CELL - 1e-6, z0 + OBJ_CELL - 1e-6)
+    return [(cx, cz) for cx in range(cx0, cx1 + 1) for cz in range(cz0, cz1 + 1)]
+
+
 class WorldStore:
     """
     Persistência permanente em SQLite (assíncrona via aiosqlite).
@@ -143,6 +169,25 @@ class WorldStore:
                 (cx, cz, obj_id, json.dumps(new_state), time.time()),
             )
             await self._db.commit()
+
+    async def find_modification(self, obj_id: str, chunks: list[tuple[int, int]]) -> Optional[dict]:
+        """Procura um obj_id já resolvido em qualquer um dos chunks dados —
+        memória global do mundo, usada pra impedir pontuar de novo algo que
+        já está destruído/coletado (outro jogador, ou antes de um restart)."""
+        async with self._lock:
+            for cx, cz in chunks:
+                cursor = await self._db.execute(
+                    "SELECT state FROM chunk_modifications WHERE cx=? AND cz=? AND obj_id=?",
+                    (cx, cz, obj_id),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row:
+                    try:
+                        return json.loads(row["state"])
+                    except json.JSONDecodeError:
+                        return {}
+        return None
 
     async def get_chunk_state(self, cx: int, cz: int) -> dict:
         async with self._lock:
@@ -210,9 +255,24 @@ class PlayerState:
 # ════════════════════════════════════════════════════════════
 # MOTOR SEMÂNTICO (Pilar 2)
 # ════════════════════════════════════════════════════════════
+def make_persisted_state(status: str, action: ActionPayload, state: PlayerState, **extra) -> dict:
+    """Estado rico gravado por objeto: não só o status bruto, mas quem
+    alterou, com que tags (o 'tipo' semântico do engine), onde e quando —
+    usado tanto por destroyed quanto collected (e qualquer status futuro,
+    ex: 'modified'), pra nunca duplicar essa montagem em mais de um lugar."""
+    return {
+        "status": status,
+        "by": action.player_id,
+        "tags": sorted(set(action.target_tags)),
+        "position": action.position or state.position,
+        "timestamp": time.time(),
+        **extra,
+    }
+
+
 class SemanticEngine:
     @staticmethod
-    def resolve(action: ActionPayload, state: PlayerState) -> tuple[dict, Optional[dict]]:
+    async def resolve(action: ActionPayload, state: PlayerState, store: WorldStore) -> tuple[dict, Optional[dict]]:
         """Retorna (resposta_ao_cliente, modificação_de_chunk | None)."""
         tags = set(action.target_tags)
         atype = action.action_type
@@ -220,6 +280,17 @@ class SemanticEngine:
 
         if oid in state.destroyed_objects:
             return {"status": "ALREADY_RESOLVED", "target_id": oid}, None
+
+        # Memória viva: antes de aplicar um efeito que persiste, confere se o
+        # MUNDO (não só esta sessão) já guarda esse oid como resolvido — sem
+        # isso, reiniciar o servidor ou um segundo jogador destruindo o mesmo
+        # objeto pontuava de novo algo que já estava destruído/coletado.
+        if "destruivel" in tags or "coletavel" in tags:
+            homes = object_home_chunks(oid) or [chunk_coords(state.position[0], state.position[2])]
+            persisted = await store.find_modification(oid, homes)
+            if persisted is not None:
+                state.destroyed_objects.add(oid)
+                return {"status": "ALREADY_RESOLVED", "target_id": oid, "resolved_state": persisted}, None
 
         result: dict = {
             "status": "NO_EFFECT",
@@ -243,7 +314,7 @@ class SemanticEngine:
             })
             if bonus:
                 result["bonus"] = bonus
-            chunk_mod = {"obj_id": oid, "state": {"status": "destroyed"}}
+            chunk_mod = {"obj_id": oid, "state": make_persisted_state("destroyed", action, state)}
             return result, chunk_mod
 
         if atype == "SHOOT" and "hostil" in tags:
@@ -261,7 +332,7 @@ class SemanticEngine:
                 "collected_item": item,
                 "player_state": state.snapshot(),
             })
-            chunk_mod = {"obj_id": oid, "state": {"status": "collected"}}
+            chunk_mod = {"obj_id": oid, "state": make_persisted_state("collected", action, state, item=item)}
             return result, chunk_mod
 
         if atype == "COLLIDE" and "hostil" in tags:
@@ -429,18 +500,25 @@ async def game_socket(websocket: WebSocket, player_id: str):
                         pass
                 continue
 
-            # Resolução semântica + persistência em chunk
+            # Resolução semântica + persistência em chunk — grava ANTES de
+            # confirmar ao cliente: se o servidor cair entre as duas coisas,
+            # melhor o cliente nunca saber do que acreditar em algo que o
+            # mundo não vai lembrar depois de um restart.
             try:
-                result, chunk_mod = engine.resolve(payload, state)
-                await manager.send(player_id, result)
+                result, chunk_mod = await engine.resolve(payload, state, world_store)
 
                 if chunk_mod:
-                    px = state.position[0]
-                    pz = state.position[2]
-                    cx, cz = chunk_coords(px, pz)
-                    await world_store.record_modification(
-                        cx, cz, chunk_mod["obj_id"], chunk_mod["state"]
-                    )
+                    # Grava em TODOS os chunks que a estrutura ocupa (não só
+                    # onde o jogador estava ao agir) — ver object_home_chunks.
+                    homes = object_home_chunks(chunk_mod["obj_id"]) or [
+                        chunk_coords(state.position[0], state.position[2])
+                    ]
+                    for cx, cz in homes:
+                        await world_store.record_modification(
+                            cx, cz, chunk_mod["obj_id"], chunk_mod["state"]
+                        )
+
+                await manager.send(player_id, result)
             except Exception as e:
                 await manager.send(player_id, {
                     "status": "ERROR",
