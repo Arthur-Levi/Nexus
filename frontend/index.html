@@ -32,10 +32,12 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
 
 #help{position:fixed;bottom:92px;left:50%;transform:translateX(-50%);z-index:10;font-size:10px;opacity:.4;letter-spacing:2px;pointer-events:none;text-align:center}
 
-#xhair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9;width:18px;height:18px;pointer-events:none;opacity:.6}
-#xhair::before,#xhair::after{content:'';position:absolute;background:#00ffcc}
+#xhair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9;width:18px;height:18px;pointer-events:none;opacity:.6;transition:opacity .1s}
+#xhair::before,#xhair::after{content:'';position:absolute;background:#00ffcc;transition:background .1s}
 #xhair::before{width:18px;height:1px;top:8px;left:0}
 #xhair::after{width:1px;height:18px;top:0;left:8px}
+#xhair.target{opacity:1;transform:translate(-50%,-50%) scale(1.35)}
+#xhair.target::before,#xhair.target::after{background:#ff3344}
 
 #flash{position:fixed;inset:0;z-index:8;background:#ff0000;opacity:0;pointer-events:none;transition:opacity .15s}
 
@@ -646,24 +648,69 @@ function applyObjectCollisions(pos, objectType) {
   return hitStructure;
 }
 
-// Raycast simplificado contra o cilindro aproximado da estrutura (mesma
-// aproximação já usada na colisão). Usado pelo SHOOT pra acertar de fato
-// o que está sendo visualmente apontado, em vez de um id arbitrário.
-function raycastStructure(ro, rd, maxDist) {
+// Raycast real por sphere tracing contra a MESMA fonte de verdade do mundo:
+// chão = sampleHeightmap/terrainHeightJS (igual à física), objeto = mesmo
+// cilindro de OBJECT_TYPE_CONFIGS já usado em applyObjectCollisions — agora
+// expresso como distância (SDF), não como teste binário "está dentro?".
+// Sem isso, atirar atravessava morros (cilindro não testava oclusão de terreno)
+// e não havia como diferenciar "acertei o chão" de "errei pro vazio".
+const SHOOT_RANGE = 50.0;
+const RAYCAST_SURF_DIST = 0.03;
+const RAYCAST_MAX_STEPS = 80;
+let liveParamsRef = null; // espelha o "liveParams" do frame atual — setado em loop() antes de qualquer raycast
+
+// Altura do chão sob (x,z) no frame atual — mesma regra usada pela física do
+// player em loop(): heightmap fora de transição, fórmula analítica durante
+// (a textura do heightmap não é reconstruída a cada frame de uma transição).
+function groundHeightAt(x, z) {
+  return styleTransition.active ? terrainHeightJS(x, z, liveParamsRef) : sampleHeightmap(x, z);
+}
+function groundDistJS(p) {
+  return (p.y - groundHeightAt(p.x, p.z)) * 0.6;
+}
+// SDF de cilindro capped (Inigo Quilez) em torno do objeto da célula sob p.xz.
+// Célula destruída devolve distância enorme — exatamente como cellDestroyed()
+// faz no map() do GLSL, então o raio simplesmente "atravessa" o que já caiu.
+function objectDistJS(p) {
+  const cellCx = Math.floor(p.x / OBJ_CELL), cellCz = Math.floor(p.z / OBJ_CELL);
+  if (destroyedCells.has(cellCx + ',' + cellCz)) return { d: 1e5, cellCx, cellCz };
   const cfg = OBJECT_TYPE_CONFIGS[Math.round(uniforms.u_objectType.value)] || OBJECT_TYPE_CONFIGS[0];
-  for (let t = 1.0; t < maxDist; t += 1.0) {
-    const px = ro.x + rd.x * t, py = ro.y + rd.y * t, pz = ro.z + rd.z * t;
-    const cellCx = Math.floor(px / OBJ_CELL), cellCz = Math.floor(pz / OBJ_CELL);
-    if (destroyedCells.has(cellCx + ',' + cellCz)) continue;
-    const ox = (cellCx + 0.5) * OBJ_CELL, oz = (cellCz + 0.5) * OBJ_CELL;
-    const baseY = sampleHeightmap(ox, oz) + 2.0;
-    if (py < baseY + cfg.bottom || py > baseY + cfg.top) continue;
-    const dx = px - ox, dz = pz - oz;
-    if (dx * dx + dz * dz <= cfg.radius * cfg.radius) {
-      return { cx: cellCx, cz: cellCz };
+  const ox = (cellCx + 0.5) * OBJ_CELL, oz = (cellCz + 0.5) * OBJ_CELL;
+  const baseY = sampleHeightmap(ox, oz) + 2.0; // mesma base usada em applyObjectCollisions
+  const midY = baseY + (cfg.top + cfg.bottom) * 0.5;
+  const halfH = (cfg.top - cfg.bottom) * 0.5;
+  const qx = p.x - ox, qz = p.z - oz, qy = p.y - midY;
+  const radial = Math.sqrt(qx * qx + qz * qz) - cfg.radius;
+  const vert = Math.abs(qy) - halfH;
+  const outside = Math.sqrt(Math.max(radial, 0) ** 2 + Math.max(vert, 0) ** 2);
+  const inside = Math.min(Math.max(radial, vert), 0);
+  return { d: outside + inside, cellCx, cellCz };
+}
+
+// Sphere tracing real: anda t += min(distChao,distObjeto) até convergir numa
+// superfície, sair do alcance, ou esgotar os passos — mesma lógica de
+// rayMarch()/map() do shader, só que em JS e limitada ao alcance do tiro.
+function raycastScene(ro, rd, maxDist) {
+  let t = 0.1;
+  for (let i = 0; i < RAYCAST_MAX_STEPS; i++) {
+    const p = { x: ro.x + rd.x * t, y: ro.y + rd.y * t, z: ro.z + rd.z * t };
+    const gd = groundDistJS(p);
+    const od = objectDistJS(p);
+    const d = Math.min(gd, od.d);
+    if (d < RAYCAST_SURF_DIST * (1 + t * 0.05)) {
+      return {
+        hit: true,
+        distance: t,
+        point: p,
+        type: od.d <= gd ? 'object' : 'terrain',
+        cellCx: od.cellCx,
+        cellCz: od.cellCz,
+      };
     }
+    t += d;
+    if (t > maxDist) break;
   }
-  return null;
+  return { hit: false, distance: maxDist, point: null, type: null, cellCx: null, cellCz: null };
 }
 
 // ─── Estado físico do player ────────────────────────────────
@@ -682,6 +729,8 @@ const LOOT_RADIUS = 4.0; // raio pra saquear destroços de uma estrutura destru�
 const player = { pos: new THREE.Vector3(0, 22, 0), yaw: 0, pitch: -0.15 };
 const keys = {};
 let pointerLocked = false;
+let aimResult = { hit: false, distance: 0, point: null, type: null, cellCx: null, cellCz: null };
+const xhairEl = document.getElementById('xhair');
 
 addEventListener('keydown', e => {
   keys[e.code] = true;
@@ -835,10 +884,15 @@ function renderInventory() {
   document.getElementById('hpTxt').textContent = health;
 }
 
+// Usa o MESMO resultado já calculado este frame para o crosshair (ver loop())
+// — garante que o tiro acerta exatamente o que o jogador via como "alvo válido",
+// nunca um recálculo divergente feito só no clique.
 function shoot() {
-  const hit = raycastStructure(player.pos, getForward(), 80);
-  if (!hit) { showToast('Sem alvo'); return; }
-  const oid = structureId(hit.cx, hit.cz);
+  if (!aimResult.hit || aimResult.type !== 'object' || aimResult.distance > SHOOT_RANGE) {
+    showToast('Sem alvo');
+    return;
+  }
+  const oid = structureId(aimResult.cellCx, aimResult.cellCz);
   if (localModified.has(oid)) { showToast('Já destruído'); return; }
   sendAction({ action_type: 'SHOOT', target_id: oid, target_tags: ['destruivel', 'hostil'] });
 }
@@ -930,6 +984,7 @@ function loop() {
     liveParams = lerpParams(prevParams, currParams, eased);
   }
   syncWorldUniforms(liveParams);
+  liveParamsRef = liveParams;
 
   const speed = (keys['ShiftLeft'] ? 22 : 12) * dt;
   const fwd = getForward();
@@ -996,6 +1051,12 @@ function loop() {
 
   uniforms.u_cameraPosition.value.copy(player.pos);
   uniforms.u_cameraDir.value.copy(getForward());
+
+  // Mira: mesmo raio do centro da tela (crosshair) que o shader desenharia
+  // em uv=(0,0) — ro=câmera, rd=forward. Resultado fica cacheado pro shoot()
+  // não recalcular nada divergente no clique.
+  aimResult = raycastScene(player.pos, getForward(), SHOOT_RANGE);
+  xhairEl.classList.toggle('target', aimResult.hit && aimResult.type === 'object');
 
   moveSendT += dt;
   if (moveSendT > 0.1) {
