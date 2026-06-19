@@ -159,16 +159,43 @@ class WorldStore:
             await self._db.close()
             self._db = None
 
-    async def record_modification(self, cx: int, cz: int, obj_id: str, new_state: dict):
+    async def try_claim(self, obj_id: str, chunks: list[tuple[int, int]], new_state: dict) -> tuple[bool, dict]:
+        """Tenta ser o único a resolver obj_id nesses chunks: dentro de UMA
+        única aquisição do lock, confere se já existe alguma resolução e, se
+        não existir, grava `new_state` em todos eles — check e write
+        atômicos, sem brecha pra outro jogador colar entre os dois. Sem
+        isso, dois jogadores atirando no mesmo objeto quase ao mesmo tempo
+        passavam os dois pelo find_modification (ainda vazio) antes de
+        qualquer um escrever, e os dois pontuavam pela mesma destruição.
+        Retorna (True, new_state) se este caller venceu a corrida, ou
+        (False, estado_já_existente) se alguém já resolveu — o caller usa
+        o segundo valor pra responder ALREADY_RESOLVED sem precisar de uma
+        segunda consulta."""
         async with self._lock:
-            await self._db.execute(
-                """INSERT INTO chunk_modifications (cx, cz, obj_id, state, updated)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(cx, cz, obj_id)
-                   DO UPDATE SET state=excluded.state, updated=excluded.updated""",
-                (cx, cz, obj_id, json.dumps(new_state), time.time()),
-            )
+            for cx, cz in chunks:
+                cursor = await self._db.execute(
+                    "SELECT state FROM chunk_modifications WHERE cx=? AND cz=? AND obj_id=?",
+                    (cx, cz, obj_id),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row:
+                    try:
+                        return False, json.loads(row["state"])
+                    except json.JSONDecodeError:
+                        return False, {}
+            payload = json.dumps(new_state)
+            now = time.time()
+            for cx, cz in chunks:
+                await self._db.execute(
+                    """INSERT INTO chunk_modifications (cx, cz, obj_id, state, updated)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(cx, cz, obj_id)
+                       DO UPDATE SET state=excluded.state, updated=excluded.updated""",
+                    (cx, cz, obj_id, payload, now),
+                )
             await self._db.commit()
+            return True, new_state
 
     async def find_modification(self, obj_id: str, chunks: list[tuple[int, int]]) -> Optional[dict]:
         """Procura um obj_id já resolvido em qualquer um dos chunks dados —
@@ -272,25 +299,32 @@ def make_persisted_state(status: str, action: ActionPayload, state: PlayerState,
 
 class SemanticEngine:
     @staticmethod
-    async def resolve(action: ActionPayload, state: PlayerState, store: WorldStore) -> tuple[dict, Optional[dict]]:
-        """Retorna (resposta_ao_cliente, modificação_de_chunk | None)."""
+    async def resolve(action: ActionPayload, state: PlayerState, store: WorldStore) -> dict:
+        """Retorna a resposta a mandar pro cliente. Persistência (quando o
+        efeito precisa sobreviver no mundo) acontece aqui dentro, via
+        store.try_claim — nunca depois, num passo separado: foi exatamente
+        o gap entre "checar se já foi resolvido" e "escrever que resolvi"
+        em dois awaits diferentes que permitia dois jogadores destruindo o
+        MESMO objeto quase ao mesmo tempo pontuarem os dois."""
         tags = set(action.target_tags)
         atype = action.action_type
         oid = action.target_id or "anon"
 
         if oid in state.destroyed_objects:
-            return {"status": "ALREADY_RESOLVED", "target_id": oid}, None
+            return {"status": "ALREADY_RESOLVED", "target_id": oid}
 
-        # Memória viva: antes de aplicar um efeito que persiste, confere se o
-        # MUNDO (não só esta sessão) já guarda esse oid como resolvido — sem
-        # isso, reiniciar o servidor ou um segundo jogador destruindo o mesmo
-        # objeto pontuava de novo algo que já estava destruído/coletado.
+        homes = object_home_chunks(oid) or [chunk_coords(state.position[0], state.position[2])]
+
+        # Fast-path: se o objeto já tem efeito persistido, nem entra na
+        # lógica de combate — só confirma o estado salvo. Isso NÃO é o que
+        # impede a corrida entre dois jogadores (quem garante isso é o
+        # try_claim, mais abaixo, check-e-write numa única aquisição do
+        # lock); é só pra não fazer trabalho à toa em algo sabidamente morto.
         if "destruivel" in tags or "coletavel" in tags:
-            homes = object_home_chunks(oid) or [chunk_coords(state.position[0], state.position[2])]
             persisted = await store.find_modification(oid, homes)
             if persisted is not None:
                 state.destroyed_objects.add(oid)
-                return {"status": "ALREADY_RESOLVED", "target_id": oid, "resolved_state": persisted}, None
+                return {"status": "ALREADY_RESOLVED", "target_id": oid, "resolved_state": persisted}
 
         result: dict = {
             "status": "NO_EFFECT",
@@ -298,10 +332,13 @@ class SemanticEngine:
             "visual_trigger": None,
             "player_state": None,
         }
-        chunk_mod = None
 
         if atype == "SHOOT" and "destruivel" in tags:
+            new_state = make_persisted_state("destroyed", action, state)
+            won, final_state = await store.try_claim(oid, homes, new_state)
             state.destroyed_objects.add(oid)
+            if not won:
+                return {"status": "ALREADY_RESOLVED", "target_id": oid, "resolved_state": final_state}
             state.score += 10
             bonus = None
             if "hostil" in tags:
@@ -314,26 +351,28 @@ class SemanticEngine:
             })
             if bonus:
                 result["bonus"] = bonus
-            chunk_mod = {"obj_id": oid, "state": make_persisted_state("destroyed", action, state)}
-            return result, chunk_mod
+            return result
 
         if atype == "SHOOT" and "hostil" in tags:
             result.update({"status": "DAMAGED", "visual_trigger": "HIT_SPARK"})
-            return result, None
+            return result
 
         if atype in ("INTERACT", "COLLIDE") and "coletavel" in tags:
             item = next((t for t in tags if t not in
                          {"coletavel", "destruivel", "hostil", "solido"}), "recurso")
-            state.inventory[item] += 1
+            new_state = make_persisted_state("collected", action, state, item=item)
+            won, final_state = await store.try_claim(oid, homes, new_state)
             state.destroyed_objects.add(oid)
+            if not won:
+                return {"status": "ALREADY_RESOLVED", "target_id": oid, "resolved_state": final_state}
+            state.inventory[item] += 1
             result.update({
                 "status": "COLLECTED",
                 "visual_trigger": "PICKUP_SHINE",
                 "collected_item": item,
                 "player_state": state.snapshot(),
             })
-            chunk_mod = {"obj_id": oid, "state": make_persisted_state("collected", action, state, item=item)}
-            return result, chunk_mod
+            return result
 
         if atype == "COLLIDE" and "hostil" in tags:
             state.health = max(0, state.health - 15)
@@ -342,17 +381,17 @@ class SemanticEngine:
                 "visual_trigger": "DAMAGE_FLASH",
                 "player_state": state.snapshot(),
             })
-            return result, None
+            return result
 
         if atype == "COLLIDE" and "solido" in tags:
             result.update({"status": "BLOCKED"})
-            return result, None
+            return result
 
         if atype == "INTERACT":
             result.update({"status": "INTERACTED", "visual_trigger": "GLOW_PULSE"})
-            return result, None
+            return result
 
-        return result, None
+        return result
 
 
 # ════════════════════════════════════════════════════════════
@@ -503,24 +542,12 @@ async def game_socket(websocket: WebSocket, player_id: str):
                         pass
                 continue
 
-            # Resolução semântica + persistência em chunk — grava ANTES de
-            # confirmar ao cliente: se o servidor cair entre as duas coisas,
-            # melhor o cliente nunca saber do que acreditar em algo que o
-            # mundo não vai lembrar depois de um restart.
+            # Resolução semântica — a persistência (quando o efeito precisa
+            # sobreviver no mundo) já acontece DENTRO do resolve(), atômica
+            # com a checagem de "alguém já resolveu isso" (ver
+            # WorldStore.try_claim). Nunca em dois passos separados aqui.
             try:
-                result, chunk_mod = await engine.resolve(payload, state, world_store)
-
-                if chunk_mod:
-                    # Grava em TODOS os chunks que a estrutura ocupa (não só
-                    # onde o jogador estava ao agir) — ver object_home_chunks.
-                    homes = object_home_chunks(chunk_mod["obj_id"]) or [
-                        chunk_coords(state.position[0], state.position[2])
-                    ]
-                    for cx, cz in homes:
-                        await world_store.record_modification(
-                            cx, cz, chunk_mod["obj_id"], chunk_mod["state"]
-                        )
-
+                result = await engine.resolve(payload, state, world_store)
                 await manager.send(player_id, result)
             except Exception as e:
                 await manager.send(player_id, {

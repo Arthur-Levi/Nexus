@@ -799,6 +799,15 @@ addEventListener('keydown', e => {
   if (e.code === 'KeyE') tryLoot();
 });
 addEventListener('keyup',   e => { keys[e.code] = false; });
+// Alternar de janela/aba com uma tecla de movimento pressionada nunca gera
+// o keyup correspondente (o SO não entrega esse evento pra uma janela sem
+// foco) — sem isso, o jogador ficava andando sozinho pra sempre até a
+// MESMA tecla ser pressionada e soltada de novo depois de voltar o foco.
+function releaseAllKeys() { for (const k in keys) keys[k] = false; }
+addEventListener('blur', releaseAllKeys);
+// visibilitychange dispara em document (não bubbla pra window) — registrar
+// no objeto global, como blur, nunca chamaria o handler.
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAllKeys(); });
 
 canvas.addEventListener('click', () => {
   if (!pointerLocked) canvas.requestPointerLock();
@@ -831,10 +840,18 @@ const STYLE_NAMES = ['Fantasia Sombria', 'Sci-Fi', 'Pós-Apocalíptico'];
 let currentPresetIndex = 0;
 let prevParams = WORLD_PRESETS[0];
 let currParams = WORLD_PRESETS[0];
+let lastLiveParams = WORLD_PRESETS[0]; // espelha o liveParams do frame mais recente (ver loop())
 
 function changeStyle(newStyle) {
   if (newStyle === currentPresetIndex) return;
-  prevParams = currParams;
+  // Parte do blend REAL visível agora (lastLiveParams), não do preset-alvo
+  // antigo (currParams) — se isso disparasse no meio de uma transição já em
+  // andamento, currParams ainda seria só o destino, e o mundo "pularia"
+  // direto pra ele em vez de continuar suavemente de onde estava. Hoje o
+  // botão da UI fica desabilitado durante toda a transição, então esse
+  // caminho não é alcançável por ali — mas a função fica correta mesmo se
+  // ganhar uma segunda forma de disparo no futuro.
+  prevParams = styleTransition.active ? lastLiveParams : currParams;
   currParams = WORLD_PRESETS[newStyle];
   currentPresetIndex = newStyle;
   uniforms.u_transition.value = 0.0;
@@ -1057,6 +1074,7 @@ function loop() {
   }
   syncWorldUniforms(liveParams);
   liveParamsRef = liveParams;
+  lastLiveParams = liveParams;
 
   const speed = (keys['ShiftLeft'] ? 22 : 12) * dt;
   const fwd = getForward();
