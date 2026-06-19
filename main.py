@@ -48,6 +48,30 @@ CHUNK_SIZE = 16.0   # unidades por chunk (malha 2D no plano XZ)
 OBJ_CELL = 48.0      # tamanho da célula de estrutura — mesmo valor de OBJ_CELL no frontend
 DB_PATH = "nexus_world.db"
 
+# ════════════════════════════════════════════════════════════
+# FORGE DE ITENS — catálogo predefinido (sem IA generativa ainda)
+# ════════════════════════════════════════════════════════════
+# Fonte única dos NÚMEROS de combate — mandado ao cliente na conexão
+# (CONNECTED.item_catalog) pra nunca duplicar damage/range/speed/defense
+# em dois lugares (o erro que já causou divergência uma vez no projeto,
+# ver terrainHeight/terrainHeightJS no histórico do CLAUDE.md). O cliente
+# só guarda localmente o mapeamento tipo→forma geométrica, que é
+# inerentemente um dado de render, não de combate.
+ITEM_CATALOG: dict[str, dict] = {
+    "espada": {"label": "Espada", "damage": 40, "range": 4.0,  "speed": 3.0, "defense": 0},
+    "lanca":  {"label": "Lança",  "damage": 40, "range": 8.0,  "speed": 1.5, "defense": 0},
+    "arco":   {"label": "Arco",   "damage": 20, "range": 60.0, "speed": 1.0, "defense": 0},
+    "escudo": {"label": "Escudo", "damage": 10, "range": 3.0,  "speed": 1.0, "defense": 10},
+}
+# Jogador sem nada equipado: mesmo dano/alcance de antes da Forge existir
+# (destrói em 1 tiro, alcance 50) — zero regressão pra quem nunca forjar.
+DEFAULT_WEAPON: dict = {"label": "Desarmado", "damage": 40, "range": 50.0, "speed": 999.0, "defense": 0}
+# Vida das estruturas "vivas" — fixo e único (elas não são item, não tem
+# por que variar por tipo). Com damage=40 do desarmado/espada/lança, ainda
+# morre em 1 tiro só; arco (20) precisa de 2; escudo (10) precisa de 4 —
+# é o que torna o dano da arma um efeito REAL, não só um número guardado.
+STRUCTURE_MAX_HP = 40
+
 rate_store: dict[str, list[float]] = defaultdict(list)
 
 def is_rate_limited(pid: str) -> bool:
@@ -69,11 +93,13 @@ class ActionPayload(BaseModel):
     target_id: Optional[str] = None
     position: Optional[list[float]] = None
     world_style: Optional[int] = None  # para SET_STYLE
+    item_type: Optional[str] = None    # para FORGE
+    item_id: Optional[str] = None      # para EQUIP
 
     @field_validator("action_type")
     @classmethod
     def valid_action(cls, v: str) -> str:
-        allowed = {"INTERACT", "COLLIDE", "SHOOT", "MOVE", "PING", "SET_STYLE"}
+        allowed = {"INTERACT", "COLLIDE", "SHOOT", "MOVE", "PING", "SET_STYLE", "FORGE", "EQUIP"}
         if v not in allowed:
             raise ValueError(f"action_type inválido: {v}")
         return v
@@ -152,6 +178,16 @@ class WorldStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_chunk ON chunk_modifications (cx, cz)"
         )
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS player_items (
+                player_id TEXT    NOT NULL,
+                item_id   TEXT    NOT NULL,
+                item_type TEXT    NOT NULL,
+                equipped  INTEGER NOT NULL DEFAULT 0,
+                created   REAL    NOT NULL,
+                PRIMARY KEY (player_id, item_id)
+            )
+        """)
         await self._db.commit()
 
     async def close(self):
@@ -159,43 +195,81 @@ class WorldStore:
             await self._db.close()
             self._db = None
 
+    async def _read_state_locked(self, obj_id: str, chunks: list[tuple[int, int]]) -> Optional[dict]:
+        """Só chamar com self._lock já adquirido pelo caller."""
+        for cx, cz in chunks:
+            cursor = await self._db.execute(
+                "SELECT state FROM chunk_modifications WHERE cx=? AND cz=? AND obj_id=?",
+                (cx, cz, obj_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row:
+                try:
+                    return json.loads(row["state"])
+                except json.JSONDecodeError:
+                    return {}
+        return None
+
+    async def _write_state_locked(self, obj_id: str, chunks: list[tuple[int, int]], new_state: dict) -> None:
+        """Só chamar com self._lock já adquirido pelo caller."""
+        payload = json.dumps(new_state)
+        now = time.time()
+        for cx, cz in chunks:
+            await self._db.execute(
+                """INSERT INTO chunk_modifications (cx, cz, obj_id, state, updated)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(cx, cz, obj_id)
+                   DO UPDATE SET state=excluded.state, updated=excluded.updated""",
+                (cx, cz, obj_id, payload, now),
+            )
+        await self._db.commit()
+
     async def try_claim(self, obj_id: str, chunks: list[tuple[int, int]], new_state: dict) -> tuple[bool, dict]:
-        """Tenta ser o único a resolver obj_id nesses chunks: dentro de UMA
-        única aquisição do lock, confere se já existe alguma resolução e, se
-        não existir, grava `new_state` em todos eles — check e write
-        atômicos, sem brecha pra outro jogador colar entre os dois. Sem
-        isso, dois jogadores atirando no mesmo objeto quase ao mesmo tempo
-        passavam os dois pelo find_modification (ainda vazio) antes de
-        qualquer um escrever, e os dois pontuavam pela mesma destruição.
+        """Tenta ser o único a resolver obj_id nesses chunks, de uma vez só
+        (sem vida/múltiplos hits — usado por coleta). Dentro de UMA única
+        aquisição do lock, confere se já existe alguma resolução e, se não
+        existir, grava `new_state` — check e write atômicos, sem brecha pra
+        outro jogador colar entre os dois. Sem isso, dois jogadores agindo
+        no mesmo objeto quase ao mesmo tempo passavam os dois pelo check
+        (ainda vazio) antes de qualquer um escrever, e os dois pontuavam
+        pelo mesmo efeito.
         Retorna (True, new_state) se este caller venceu a corrida, ou
-        (False, estado_já_existente) se alguém já resolveu — o caller usa
-        o segundo valor pra responder ALREADY_RESOLVED sem precisar de uma
-        segunda consulta."""
+        (False, estado_já_existente) se alguém já resolveu."""
         async with self._lock:
-            for cx, cz in chunks:
-                cursor = await self._db.execute(
-                    "SELECT state FROM chunk_modifications WHERE cx=? AND cz=? AND obj_id=?",
-                    (cx, cz, obj_id),
-                )
-                row = await cursor.fetchone()
-                await cursor.close()
-                if row:
-                    try:
-                        return False, json.loads(row["state"])
-                    except json.JSONDecodeError:
-                        return False, {}
-            payload = json.dumps(new_state)
-            now = time.time()
-            for cx, cz in chunks:
-                await self._db.execute(
-                    """INSERT INTO chunk_modifications (cx, cz, obj_id, state, updated)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(cx, cz, obj_id)
-                       DO UPDATE SET state=excluded.state, updated=excluded.updated""",
-                    (cx, cz, obj_id, payload, now),
-                )
-            await self._db.commit()
+            existing = await self._read_state_locked(obj_id, chunks)
+            if existing is not None:
+                return False, existing
+            await self._write_state_locked(obj_id, chunks, new_state)
             return True, new_state
+
+    async def apply_damage(self, obj_id: str, chunks: list[tuple[int, int]], damage: int,
+                            max_hp: int, meta: dict) -> tuple[dict, bool]:
+        """Aplica `damage` num objeto com vida: lê o hp atual (ou parte de
+        max_hp se for o primeiro hit), e escreve o novo hp — ou o estado
+        terminal "destroyed" se a vida zerar — tudo dentro de UMA aquisição
+        do lock. Sem isso, dois hits simultâneos no mesmo objeto podiam ler
+        o MESMO hp antigo e cada um aplicar dano sobre ele, perdendo um dos
+        hits (o mesmo tipo de corrida que try_claim resolve pra efeitos de
+        um hit só — aqui generalizado pra hits que se acumulam).
+        `meta` são os campos comuns (by/tags/position/timestamp) já
+        calculados pelo caller — não dependem da corrida, só o hp depende.
+        Retorna (estado_final, causei_eu_a_destruição) — o segundo valor
+        diferencia "eu destruí agora" de "já estava destruído quando cheguei"
+        (não pontuar por um kill que não foi seu)."""
+        async with self._lock:
+            existing = await self._read_state_locked(obj_id, chunks)
+            if existing is not None and existing.get("status") in ("destroyed", "collected"):
+                return existing, False
+            current_hp = existing["hp_remaining"] if existing and existing.get("status") == "damaged" else max_hp
+            new_hp = current_hp - damage
+            if new_hp <= 0:
+                new_state = {**meta, "status": "destroyed"}
+                await self._write_state_locked(obj_id, chunks, new_state)
+                return new_state, True
+            new_state = {**meta, "status": "damaged", "hp_remaining": new_hp, "max_hp": max_hp}
+            await self._write_state_locked(obj_id, chunks, new_state)
+            return new_state, False
 
     async def find_modification(self, obj_id: str, chunks: list[tuple[int, int]]) -> Optional[dict]:
         """Procura um obj_id já resolvido em qualquer um dos chunks dados —
@@ -251,6 +325,40 @@ class WorldStore:
             await cursor.close()
         return row["n"] if row else 0
 
+    async def add_player_item(self, player_id: str, item_id: str, item_type: str) -> None:
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO player_items (player_id, item_id, item_type, equipped, created) VALUES (?, ?, ?, 0, ?)",
+                (player_id, item_id, item_type, time.time()),
+            )
+            await self._db.commit()
+
+    async def set_equipped_item(self, player_id: str, item_id: str) -> None:
+        async with self._lock:
+            await self._db.execute("UPDATE player_items SET equipped=0 WHERE player_id=?", (player_id,))
+            await self._db.execute(
+                "UPDATE player_items SET equipped=1 WHERE player_id=? AND item_id=?", (player_id, item_id)
+            )
+            await self._db.commit()
+
+    async def load_player_items(self, player_id: str, state: "PlayerState") -> None:
+        """Hidrata state.items/equipped_item_id a partir do SQLite — chamado
+        a cada conexão. O PlayerState em memória nasce vazio tanto num
+        reload de página (mesmo player_id salvo no localStorage do
+        cliente) quanto num reinício do servidor; nos dois casos é o banco
+        quem garante a continuidade, nunca a memória do processo."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "SELECT item_id, item_type, equipped FROM player_items WHERE player_id=?",
+                (player_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        for row in rows:
+            state.items[row["item_id"]] = {"type": row["item_type"]}
+            if row["equipped"]:
+                state.equipped_item_id = row["item_id"]
+
 
 world_store = WorldStore()
 
@@ -268,6 +376,16 @@ class PlayerState:
         self.world_style = 0
         self.current_chunk: Optional[tuple[int, int]] = None
         self.destroyed_objects: set[str] = set()
+        self.items: dict[str, dict] = {}
+        self.equipped_item_id: Optional[str] = None
+
+    def equipped_weapon(self) -> dict:
+        """Stats de combate em uso agora — do item equipado (se existir e
+        ainda for um tipo válido do catálogo) ou do desarmado por padrão."""
+        if self.equipped_item_id and self.equipped_item_id in self.items:
+            item_type = self.items[self.equipped_item_id]["type"]
+            return ITEM_CATALOG.get(item_type, DEFAULT_WEAPON)
+        return DEFAULT_WEAPON
 
     def snapshot(self) -> dict:
         return {
@@ -276,25 +394,31 @@ class PlayerState:
             "health": self.health,
             "score": self.score,
             "world_style": self.world_style,
+            "items": [{"id": iid, "type": idata["type"]} for iid, idata in self.items.items()],
+            "equipped_item_id": self.equipped_item_id,
         }
 
 
 # ════════════════════════════════════════════════════════════
 # MOTOR SEMÂNTICO (Pilar 2)
 # ════════════════════════════════════════════════════════════
-def make_persisted_state(status: str, action: ActionPayload, state: PlayerState, **extra) -> dict:
-    """Estado rico gravado por objeto: não só o status bruto, mas quem
-    alterou, com que tags (o 'tipo' semântico do engine), onde e quando —
-    usado tanto por destroyed quanto collected (e qualquer status futuro,
-    ex: 'modified'), pra nunca duplicar essa montagem em mais de um lugar."""
+def make_persisted_meta(action: ActionPayload, state: PlayerState) -> dict:
+    """Campos comuns de qualquer estado persistido de objeto: quem alterou,
+    com que tags, onde e quando. Usado tanto por efeitos de um hit só
+    (destroyed/collected, via try_claim — status já conhecido antes do
+    write) quanto por efeitos com vida que podem virar "damaged" ou
+    "destroyed" dependendo do hp atual (via apply_damage — só decidido
+    DENTRO do lock, depois de ler o hp), pra nunca duplicar essa montagem."""
     return {
-        "status": status,
         "by": action.player_id,
         "tags": sorted(set(action.target_tags)),
         "position": action.position or state.position,
         "timestamp": time.time(),
-        **extra,
     }
+
+
+def make_persisted_state(status: str, action: ActionPayload, state: PlayerState, **extra) -> dict:
+    return {**make_persisted_meta(action, state), "status": status, **extra}
 
 
 class SemanticEngine:
@@ -302,10 +426,11 @@ class SemanticEngine:
     async def resolve(action: ActionPayload, state: PlayerState, store: WorldStore) -> dict:
         """Retorna a resposta a mandar pro cliente. Persistência (quando o
         efeito precisa sobreviver no mundo) acontece aqui dentro, via
-        store.try_claim — nunca depois, num passo separado: foi exatamente
-        o gap entre "checar se já foi resolvido" e "escrever que resolvi"
-        em dois awaits diferentes que permitia dois jogadores destruindo o
-        MESMO objeto quase ao mesmo tempo pontuarem os dois."""
+        store.try_claim ou store.apply_damage — nunca depois, num passo
+        separado: foi exatamente o gap entre "checar se já foi resolvido" e
+        "escrever que resolvi" em dois awaits diferentes que permitia dois
+        jogadores destruindo o MESMO objeto quase ao mesmo tempo pontuarem
+        os dois."""
         tags = set(action.target_tags)
         atype = action.action_type
         oid = action.target_id or "anon"
@@ -315,12 +440,12 @@ class SemanticEngine:
 
         homes = object_home_chunks(oid) or [chunk_coords(state.position[0], state.position[2])]
 
-        # Fast-path: se o objeto já tem efeito persistido, nem entra na
-        # lógica de combate — só confirma o estado salvo. Isso NÃO é o que
-        # impede a corrida entre dois jogadores (quem garante isso é o
-        # try_claim, mais abaixo, check-e-write numa única aquisição do
-        # lock); é só pra não fazer trabalho à toa em algo sabidamente morto.
-        if "destruivel" in tags or "coletavel" in tags:
+        # Fast-path só pra coleta (um hit só, sem vida): se o objeto já tem
+        # efeito persistido, nem entra na lógica — só confirma o estado
+        # salvo. O fluxo de dano com vida (destruivel, abaixo) NÃO passa por
+        # aqui — apply_damage já faz essa checagem atomicamente por conta
+        # própria, e fazer os dois seria a mesma checagem em dois lugares.
+        if "coletavel" in tags:
             persisted = await store.find_modification(oid, homes)
             if persisted is not None:
                 state.destroyed_objects.add(oid)
@@ -334,23 +459,37 @@ class SemanticEngine:
         }
 
         if atype == "SHOOT" and "destruivel" in tags:
-            new_state = make_persisted_state("destroyed", action, state)
-            won, final_state = await store.try_claim(oid, homes, new_state)
-            state.destroyed_objects.add(oid)
-            if not won:
+            weapon = state.equipped_weapon()
+            meta = make_persisted_meta(action, state)
+            final_state, caused_destroy = await store.apply_damage(oid, homes, weapon["damage"], STRUCTURE_MAX_HP, meta)
+            if final_state.get("status") in ("destroyed", "collected") and not caused_destroy:
+                # Já estava destruído quando chegamos (outro jogador ganhou
+                # a corrida) — não é nosso kill, não pontua.
+                state.destroyed_objects.add(oid)
                 return {"status": "ALREADY_RESOLVED", "target_id": oid, "resolved_state": final_state}
-            state.score += 10
-            bonus = None
-            if "hostil" in tags:
-                state.score += 25
-                bonus = "HOSTILE_ELIMINATED"
+            if caused_destroy:
+                state.destroyed_objects.add(oid)
+                state.score += 10
+                bonus = None
+                if "hostil" in tags:
+                    state.score += 25
+                    bonus = "HOSTILE_ELIMINATED"
+                result.update({
+                    "status": "DESTROYED",
+                    "visual_trigger": "EXPLODE_PARTICLES",
+                    "player_state": state.snapshot(),
+                })
+                if bonus:
+                    result["bonus"] = bonus
+                return result
+            # Hp não zerou ainda — estrutura continua viva e shootável,
+            # então NÃO entra em destroyed_objects.
             result.update({
-                "status": "DESTROYED",
-                "visual_trigger": "EXPLODE_PARTICLES",
-                "player_state": state.snapshot(),
+                "status": "DAMAGED",
+                "visual_trigger": "HIT_SPARK",
+                "hp_remaining": final_state["hp_remaining"],
+                "max_hp": final_state["max_hp"],
             })
-            if bonus:
-                result["bonus"] = bonus
             return result
 
         if atype == "SHOOT" and "hostil" in tags:
@@ -375,7 +514,9 @@ class SemanticEngine:
             return result
 
         if atype == "COLLIDE" and "hostil" in tags:
-            state.health = max(0, state.health - 15)
+            defense = state.equipped_weapon()["defense"]
+            incoming = max(1, 15 - defense)  # nunca zero -- defesa reduz, não anula
+            state.health = max(0, state.health - incoming)
             result.update({
                 "status": "PLAYER_HIT",
                 "visual_trigger": "DAMAGE_FLASH",
@@ -410,9 +551,18 @@ class ConnectionManager:
             if pid not in self._states:
                 self._states[pid] = PlayerState(pid)
 
-    async def disconnect(self, pid: str):
+    async def disconnect(self, pid: str, ws: WebSocket):
         async with self._lock:
-            self._conns.pop(pid, None)
+            # Só remove se a conexão registrada AGORA pra esse pid ainda for
+            # ESTA websocket — sem isso, reconectar rápido com o mesmo
+            # player_id (exatamente o que um F5 faz, já que o id agora é
+            # persistido no localStorage) é uma corrida: a conexão nova
+            # registra primeiro, e o cleanup da conexão velha (que só roda
+            # depois, quando seu loop percebe o close) apagava a entrada da
+            # conexão NOVA por engano — o cliente reconectado nunca mais
+            # recebia nada do servidor, silenciosamente.
+            if self._conns.get(pid) is ws:
+                self._conns.pop(pid, None)
         # player_id é aleatório por sessão de página — sem isso, rate_store
         # acumula uma entrada por visita pra sempre num servidor de longa duração.
         rate_store.pop(pid, None)
@@ -428,7 +578,7 @@ class ConnectionManager:
             try:
                 await ws.send_json(msg)
             except Exception:
-                await self.disconnect(pid)
+                await self.disconnect(pid, ws)
 
 
 manager = ConnectionManager()
@@ -484,12 +634,19 @@ async def serve_index():
 async def game_socket(websocket: WebSocket, player_id: str):
     await manager.connect(player_id, websocket)
     state = manager.get_state(player_id)
+    # Hidrata o inventário forjado a partir do SQLite a cada conexão —
+    # cobre tanto reload de página (mesmo player_id no localStorage do
+    # cliente) quanto reinício do servidor, com o mesmo código nos dois
+    # casos (o PlayerState em memória nasce vazio igual nas duas situações).
+    await world_store.load_player_items(player_id, state)
 
     await manager.send(player_id, {
         "status": "CONNECTED",
         "player_id": player_id,
         "player_state": state.snapshot(),
         "chunk_size": CHUNK_SIZE,
+        "item_catalog": ITEM_CATALOG,
+        "default_weapon": DEFAULT_WEAPON,
     })
 
     try:
@@ -529,6 +686,48 @@ async def game_socket(websocket: WebSocket, player_id: str):
                     })
                 continue
 
+            # FORGE — cria um item do catálogo e adiciona ao inventário
+            if payload.action_type == "FORGE":
+                item_type = payload.item_type
+                if item_type not in ITEM_CATALOG:
+                    await manager.send(player_id, {
+                        "status": "ERROR",
+                        "message": f"Tipo de item inválido: {item_type}",
+                    })
+                    continue
+                # Contador local é seguro como sufixo do id porque o
+                # inventário já foi hidratado do banco ANTES do primeiro
+                # FORGE desta sessão (ver load_player_items) — nunca colide
+                # com um item de uma sessão anterior do mesmo jogador.
+                item_id = f"{item_type}_{len(state.items)}"
+                state.items[item_id] = {"type": item_type}
+                await world_store.add_player_item(player_id, item_id, item_type)
+                await manager.send(player_id, {
+                    "status": "FORGED",
+                    "item": {"id": item_id, "type": item_type, "label": ITEM_CATALOG[item_type]["label"]},
+                    "player_state": state.snapshot(),
+                })
+                continue
+
+            # EQUIP — troca o item ativo (1 slot só)
+            if payload.action_type == "EQUIP":
+                item_id = payload.item_id
+                if not item_id or item_id not in state.items:
+                    await manager.send(player_id, {
+                        "status": "ERROR",
+                        "message": f"Item desconhecido: {item_id}",
+                    })
+                    continue
+                state.equipped_item_id = item_id
+                await world_store.set_equipped_item(player_id, item_id)
+                await manager.send(player_id, {
+                    "status": "EQUIPPED",
+                    "item_id": item_id,
+                    "item_type": state.items[item_id]["type"],
+                    "player_state": state.snapshot(),
+                })
+                continue
+
             # MOVE — atualiza posição + reconciliação de chunk
             if payload.action_type == "MOVE":
                 if payload.position and len(payload.position) == 3:
@@ -563,7 +762,7 @@ async def game_socket(websocket: WebSocket, player_id: str):
         except Exception:
             pass
     finally:
-        await manager.disconnect(player_id)
+        await manager.disconnect(player_id, websocket)
 
 
 if __name__ == "__main__":

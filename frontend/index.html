@@ -16,19 +16,22 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
 #stats{position:fixed;top:12px;right:12px;z-index:10;font-size:11px;text-align:right;background:rgba(0,0,0,.5);padding:10px 14px;border:1px solid rgba(0,255,204,.25);border-radius:6px;backdrop-filter:blur(6px);pointer-events:none;line-height:1.6}
 #stats .v{color:#00ffcc;font-weight:bold}
 
-#panel{position:fixed;bottom:16px;right:16px;z-index:12;background:rgba(2,2,12,.78);border:1px solid rgba(0,255,204,.35);border-radius:10px;padding:14px 16px;backdrop-filter:blur(12px);box-shadow:0 0 30px rgba(0,255,204,.12);width:236px}
-#panel h3{font-size:11px;letter-spacing:3px;color:#00ffcc;margin-bottom:10px;text-transform:uppercase;opacity:.9}
-#panel label{display:block;font-size:10px;opacity:.6;margin-bottom:5px;letter-spacing:1px}
-#styleSel{width:100%;background:#06060f;border:1px solid rgba(0,255,204,.3);color:#cfe;font-family:inherit;font-size:12px;padding:8px 10px;border-radius:6px;outline:none;cursor:pointer;margin-bottom:12px}
-#styleSel option{background:#06060f}
-#fuseBtn{width:100%;background:linear-gradient(135deg,#00ffcc,#0099bb);border:none;color:#001a18;font-family:inherit;font-weight:bold;font-size:12px;letter-spacing:1.5px;padding:10px;border-radius:6px;cursor:pointer;transition:filter .15s,transform .1s}
-#fuseBtn:hover{filter:brightness(1.15);transform:scale(1.02)}
-#fuseBtn:active{transform:scale(.98)}
-#fuseBtn:disabled{opacity:.4;cursor:wait}
+#rightPanels{position:fixed;bottom:16px;right:16px;z-index:12;display:flex;flex-direction:column-reverse;gap:12px;width:236px}
+#panel,#forgePanel{background:rgba(2,2,12,.78);border:1px solid rgba(0,255,204,.35);border-radius:10px;padding:14px 16px;backdrop-filter:blur(12px);box-shadow:0 0 30px rgba(0,255,204,.12)}
+#panel h3,#forgePanel h3{font-size:11px;letter-spacing:3px;color:#00ffcc;margin-bottom:10px;text-transform:uppercase;opacity:.9}
+#panel label,#forgePanel label{display:block;font-size:10px;opacity:.6;margin-bottom:5px;letter-spacing:1px}
+#styleSel,#itemTypeSel{width:100%;background:#06060f;border:1px solid rgba(0,255,204,.3);color:#cfe;font-family:inherit;font-size:12px;padding:8px 10px;border-radius:6px;outline:none;cursor:pointer;margin-bottom:12px}
+#styleSel option,#itemTypeSel option{background:#06060f}
+#fuseBtn,#forgeBtn{width:100%;background:linear-gradient(135deg,#00ffcc,#0099bb);border:none;color:#001a18;font-family:inherit;font-weight:bold;font-size:12px;letter-spacing:1.5px;padding:10px;border-radius:6px;cursor:pointer;transition:filter .15s,transform .1s}
+#fuseBtn:hover,#forgeBtn:hover{filter:brightness(1.15);transform:scale(1.02)}
+#fuseBtn:active,#forgeBtn:active{transform:scale(.98)}
+#fuseBtn:disabled,#forgeBtn:disabled{opacity:.4;cursor:wait}
 #styleInfo{font-size:10px;opacity:.5;margin-top:10px;line-height:1.5}
 
 #inv{position:fixed;bottom:16px;left:12px;z-index:10;font-size:11px;background:rgba(0,0,0,.5);padding:8px 12px;border:1px solid rgba(0,255,204,.2);border-radius:6px;backdrop-filter:blur(6px);pointer-events:none;min-width:130px}
 #inv b{color:#00ffcc}
+#itemsList .equipBtn{font-size:9px;padding:2px 6px;cursor:pointer;background:#06060f;border:1px solid rgba(0,255,204,.4);color:#00ffcc;border-radius:4px;pointer-events:auto}
+#itemsList .itemRow{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:3px}
 
 #help{position:fixed;bottom:92px;left:50%;transform:translateX(-50%);z-index:10;font-size:10px;opacity:.4;letter-spacing:2px;pointer-events:none;text-align:center}
 
@@ -65,20 +68,28 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
   <div>Assets <span class="v">0 MB</span></div>
 </div>
 
-<div id="inv"><b>INVENTÁRIO</b><div id="invList">vazio</div><div style="margin-top:4px">Score: <b id="scoreTxt">0</b></div><div style="margin-top:4px">HP: <b id="hpTxt">100</b></div></div>
+<div id="inv"><b>INVENTÁRIO</b><div id="invList">vazio</div><div id="itemsList"></div><div style="margin-top:4px">Score: <b id="scoreTxt">0</b></div><div style="margin-top:4px">HP: <b id="hpTxt">100</b></div></div>
 
 <div id="help">WASD mover · MOUSE olhar · ESPAÇO pular · V voar · CLICK travar/atirar · E saquear · SHIFT correr</div>
 
-<div id="panel">
-  <h3>Fusão de Universos</h3>
-  <label>Estética do mundo</label>
-  <select id="styleSel">
-    <option value="0">🜂 Fantasia Sombria</option>
-    <option value="1">⬡ Sci-Fi</option>
-    <option value="2">☢ Pós-Apocalíptico</option>
-  </select>
-  <button id="fuseBtn">⚡ FUNDIR UNIVERSO</button>
-  <div id="styleInfo">Cada mundo tem terreno, atmosfera e estruturas próprias. A costura acontece na GPU em menos de 1 segundo.</div>
+<div id="rightPanels">
+  <div id="panel">
+    <h3>Fusão de Universos</h3>
+    <label>Estética do mundo</label>
+    <select id="styleSel">
+      <option value="0">🜂 Fantasia Sombria</option>
+      <option value="1">⬡ Sci-Fi</option>
+      <option value="2">☢ Pós-Apocalíptico</option>
+    </select>
+    <button id="fuseBtn">⚡ FUNDIR UNIVERSO</button>
+    <div id="styleInfo">Cada mundo tem terreno, atmosfera e estruturas próprias. A costura acontece na GPU em menos de 1 segundo.</div>
+  </div>
+  <div id="forgePanel">
+    <h3>Forge de Itens</h3>
+    <label>Tipo de item</label>
+    <select id="itemTypeSel"></select>
+    <button id="forgeBtn">🔨 FORJAR ITEM</button>
+  </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -146,6 +157,9 @@ const uniforms = {
   u_sunColor:     { value: new THREE.Vector3(1.0, 0.92, 0.78) },
   u_metalness:    { value: 0.25 },
   u_objectType:   { value: 0.0 },
+  // Arma equipada (viewmodel) — eixo independente do mundo/objeto, por
+  // isso fora de WORLD_PRESETS. 0 = espada (padrão antes de forjar nada).
+  u_weaponType:   { value: 0.0 },
 };
 
 function syncDestroyedUniform() {
@@ -272,6 +286,7 @@ const fragmentShader = `
   uniform vec3  u_sunColor;
   uniform float u_metalness;
   uniform float u_objectType;
+  uniform float u_weaponType;
 
   const int   MAX_STEPS = 80;
   const float SURF_DIST = 0.03;
@@ -338,24 +353,25 @@ const fragmentShader = `
     return base+peaks+craters+detail-7.0;
   }
 
+  float sdBox(vec3 p, vec3 b){
+    vec3 d=abs(p)-b;
+    return length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+  }
+
   // Forma do objeto — eixo independente do terreno (u_objectType escolhe a
   // família de forma; não precisa ser float32==float64 exato como a altura,
   // já que a colisão em JS usa um cilindro aproximado, não esta SDF exata).
   float objectSDF(vec3 q, float objType){
     if(objType<0.5){
       // ── TORRE/PILAR GÓTICO com topo pontiagudo ──
-      vec3 b=vec3(0.8,4.0,0.8);
-      vec3 d=abs(q)-b;
-      float tower=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+      float tower=sdBox(q, vec3(0.8,4.0,0.8));
       // telhado cônico no topo
       vec3 tp=q-vec3(0.0,4.0,0.0);
       float cone=max(length(tp.xz)*0.7+tp.y-1.5, -tp.y-1.5);
       return min(tower, cone);
     } else if(objType<1.5){
       // ── MONÓLITO/ANTENA TECNOLÓGICA ──
-      vec3 b=vec3(0.5,3.5,0.5);
-      vec3 d=abs(q)-b;
-      float pillar=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+      float pillar=sdBox(q, vec3(0.5,3.5,0.5));
       // anel orbitando
       vec3 rp=q-vec3(0.0,3.0,0.0);
       rp.xz=rot2(u_time*0.8)*rp.xz;
@@ -365,12 +381,41 @@ const fragmentShader = `
     } else {
       // ── RUÍNA QUEBRADA/INCLINADA ──
       q.xz=rot2(0.3)*q.xz; // inclinada
-      vec3 b=vec3(1.0,2.5,0.6);
-      vec3 d=abs(q)-b;
-      float wall=length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+      float wall=sdBox(q, vec3(1.0,2.5,0.6));
       // recorte irregular no topo (destruição)
       float crack=length(max(abs(q-vec3(0.5,2.5,0.0))-vec3(0.8,0.8,1.0),0.0));
       return max(wall, -(crack-0.4));
+    }
+  }
+
+  // Viewmodel da arma equipada — mesma convenção de u_objectType: família
+  // de forma discreta por tipo (só 4 predefinidos, sem IA generativa
+  // ainda). O espaço de entrada já é local à arma (alinhado à câmera,
+  // resolvido em map() — ver lá o porquê).
+  float weaponSDF(vec3 q, float wType){
+    if(wType<0.5){
+      // ── ESPADA: lâmina fina + guarda + cabo ──
+      float blade=sdBox(q-vec3(0.0,0.16,0.0), vec3(0.022,0.20,0.05));
+      float guard=sdBox(q-vec3(0.0,-0.05,0.0), vec3(0.06,0.018,0.018));
+      float hilt=sdBox(q-vec3(0.0,-0.12,0.0), vec3(0.022,0.07,0.022));
+      return min(min(blade,guard),hilt);
+    } else if(wType<1.5){
+      // ── ESCUDO: disco achatado com calombo central ──
+      float disc=sdBox(q, vec3(0.16,0.16,0.025));
+      float boss=length(q-vec3(0.0,0.0,0.03))-0.04;
+      return min(disc,boss);
+    } else if(wType<2.5){
+      // ── LANÇA: cabo longo + ponta cônica ──
+      float shaft=sdBox(q, vec3(0.016,0.40,0.016));
+      vec3 tp=q-vec3(0.0,0.40,0.0);
+      float tip=max(length(tp.xz)*1.6+tp.y-0.14, -tp.y-0.14);
+      return min(shaft,tip);
+    } else {
+      // ── ARCO: anel fino + empunhadura ──
+      vec2 ringQ=vec2(length(q.xy)-0.20, q.z);
+      float ring=length(ringQ)-0.018;
+      float grip=sdBox(q, vec3(0.018,0.045,0.018));
+      return min(ring,grip);
     }
   }
 
@@ -392,7 +437,20 @@ const fragmentShader = `
       float baseY=terrainHeight(cellCenter,u_terrainScale,u_peakHeight,u_ridgeAmount,u_craterAmount)+2.0;
       obj=objectSDF(q-vec3(0.0,baseY,0.0), u_objectType);
     }
-    return min(ground, obj);
+
+    // Viewmodel da arma: sempre no mesmo lugar relativo à câmera (clássico
+    // "primeira pessoa"), girando junto com ela via sua própria base local
+    // (forward/right/up) — sem isso, a arma ficaria "presa" no mundo em vez
+    // de na mão do jogador. É só mais um SDF na união: não afeta colisão
+    // física (essa usa heightmap+cilindros em JS, nunca este map()).
+    vec3 camFwd=normalize(u_cameraDir);
+    vec3 camRight=normalize(cross(vec3(0,1,0),camFwd));
+    vec3 camUp=cross(camFwd,camRight);
+    vec3 wOff=p-(u_cameraPosition+camFwd*0.55+camRight*0.26-camUp*0.20);
+    vec3 wLocal=vec3(dot(wOff,camRight),dot(wOff,camUp),dot(wOff,camFwd));
+    float weapon=weaponSDF(wLocal,u_weaponType);
+
+    return min(min(ground, obj), weapon);
   }
 
   vec3 calcNormal(vec3 p){
@@ -707,7 +765,9 @@ function applyObjectCollisions(pos, objectType) {
 // expresso como distância (SDF), não como teste binário "está dentro?".
 // Sem isso, atirar atravessava morros (cilindro não testava oclusão de terreno)
 // e não havia como diferenciar "acertei o chão" de "errei pro vazio".
-const SHOOT_RANGE = 50.0;
+// Alcance máximo não é mais fixo: vem de currentWeapon.range (Forge de
+// Itens) — RAYCAST_SURF_DIST/MAX_STEPS continuam fixos, são tolerância e
+// orçamento de passos do sphere tracing, não o alcance em si.
 const RAYCAST_SURF_DIST = 0.03;
 const RAYCAST_MAX_STEPS = 80;
 let liveParamsRef = null; // espelha o "liveParams" do frame atual — setado em loop() antes de qualquer raycast
@@ -863,10 +923,38 @@ function changeStyle(newStyle) {
 }
 
 // ─── WebSocket ──────────────────────────────────────────────
-const PLAYER_ID = 'player_' + Math.random().toString(36).slice(2, 8);
+// Persistido no localStorage — sem isso, cada reload gerava um player_id
+// novo e o servidor via uma sessão nova do zero, sem inventário/itens
+// (o mundo em si sobrevivia porque é amarrado a chunk, não a jogador;
+// mas o que é DESTE jogador nunca sobrevivia a um F5).
+function loadOrCreatePlayerId() {
+  const saved = localStorage.getItem('nexus_player_id');
+  if (saved) return saved;
+  const fresh = 'player_' + Math.random().toString(36).slice(2, 8);
+  localStorage.setItem('nexus_player_id', fresh);
+  return fresh;
+}
+const PLAYER_ID = loadOrCreatePlayerId();
 let ws = null, reconnDelay = 1000, reconnTimer = null;
 let inventory = {}, score = 0, health = 100, chunkSize = 16;
 const localModified = new Set();
+
+// ─── Forge de Itens ─────────────────────────────────────────
+// ITEM_TYPES fixa a ordem == índice da forma no shader (u_weaponType);
+// é o único dado de tipo que precisa existir nos dois lados (servidor
+// também precisa validar o MESMO conjunto de chaves) — os NÚMEROS de
+// combate (damage/range/speed/defense), porém, só existem no servidor e
+// chegam via CONNECTED.item_catalog, nunca hardcoded aqui.
+const ITEM_TYPES = ['espada', 'escudo', 'lanca', 'arco'];
+const ITEM_LABELS = { espada: 'Espada', escudo: 'Escudo', lanca: 'Lança', arco: 'Arco' };
+let itemCatalog = {};
+// Fallback só até o primeiro CONNECTED chegar (igual ao DEFAULT_WEAPON do
+// servidor) — depois disso o servidor sempre manda o valor real.
+let defaultWeapon = { label: 'Desarmado', damage: 40, range: 50.0, speed: 999, defense: 0 };
+let myItems = [];            // [{id, type}]
+let equippedItemId = null;
+let currentWeapon = defaultWeapon; // stats em uso agora (raycast/cooldown)
+let lastShotTime = -Infinity;
 
 // Aplica um estado persistido (vindo do servidor) ao mundo local — o
 // `status` real decide o efeito explicitamente; parseStructureId só
@@ -875,15 +963,18 @@ const localModified = new Set();
 // padrão struct_X_Z era tratado como destruído, mesmo vindo de um status
 // diferente — agora cada status decide seu próprio efeito).
 function applyPersistedState(oid, state) {
-  localModified.add(oid);
   const status = state && state.status;
   if (status === 'destroyed') {
+    localModified.add(oid);
     const parsed = parseStructureId(oid);
     if (parsed) markCellDestroyed(parsed.cx, parsed.cz);
+  } else if (status === 'collected') {
+    localModified.add(oid);
   }
-  // 'collected' e qualquer status futuro (ex: 'modified'): por ora o
-  // registro em localModified acima já é o efeito completo — sem mudança
-  // visual ou de colisão associada ainda.
+  // 'damaged' NÃO entra em localModified de propósito: a estrutura
+  // continua viva e shootável (tem vida, não morreu ainda) — se entrasse,
+  // o jogador nunca conseguiria dar o segundo tiro depois de uma
+  // reconciliação de chunk no meio de uma sequência de hits.
 }
 
 function wsUrl() {
@@ -929,6 +1020,8 @@ function onServerMsg(d) {
   switch (d.status) {
     case 'CONNECTED':
       if (d.chunk_size) chunkSize = d.chunk_size;
+      if (d.item_catalog) itemCatalog = d.item_catalog;
+      if (d.default_weapon) defaultWeapon = d.default_weapon;
       if (d.player_state) applyState(d.player_state);
       break;
     case 'DESTROYED':
@@ -936,8 +1029,19 @@ function onServerMsg(d) {
       if (d.target_id) applyPersistedState(d.target_id, { status: 'destroyed' });
       if (d.player_state) applyState(d.player_state);
       break;
+    case 'DAMAGED':
+      if (typeof d.hp_remaining === 'number') showToast(`💥 Acertou! HP: ${d.hp_remaining}/${d.max_hp}`);
+      break;
     case 'COLLECTED':
       if (d.target_id) applyPersistedState(d.target_id, { status: 'collected' });
+      if (d.player_state) applyState(d.player_state);
+      break;
+    case 'FORGED':
+      showToast('🔨 ' + (d.item ? d.item.label : 'Item') + ' forjado');
+      if (d.player_state) applyState(d.player_state);
+      break;
+    case 'EQUIPPED':
+      showToast('⚔️ Equipado: ' + (ITEM_LABELS[d.item_type] || d.item_type));
       if (d.player_state) applyState(d.player_state);
       break;
     case 'PLAYER_HIT':
@@ -963,7 +1067,19 @@ function applyState(s) {
   if (s.inventory) inventory = s.inventory;
   if (typeof s.score === 'number') score = s.score;
   if (typeof s.health === 'number') health = s.health;
+  if (s.items) myItems = s.items;
+  if ('equipped_item_id' in s) equippedItemId = s.equipped_item_id;
+  updateEquippedWeapon();
   renderInventory();
+}
+// Mantém o que de fato afeta o combate (raycast/cooldown) e o uniform da
+// SDF da arma sincronizados com o item equipado — chamado sempre que o
+// player_state muda (forjar, equipar, conectar, qualquer ação que volte
+// inventário atualizado).
+function updateEquippedWeapon() {
+  const equipped = myItems.find(it => it.id === equippedItemId);
+  currentWeapon = equipped ? (itemCatalog[equipped.type] || defaultWeapon) : defaultWeapon;
+  uniforms.u_weaponType.value = equipped ? ITEM_TYPES.indexOf(equipped.type) : 0;
 }
 function renderInventory() {
   const list = document.getElementById('invList');
@@ -971,18 +1087,45 @@ function renderInventory() {
   list.innerHTML = items.length ? items.map(([k,v]) => `${k}: <b>${v}</b>`).join('<br>') : 'vazio';
   document.getElementById('scoreTxt').textContent = score;
   document.getElementById('hpTxt').textContent = health;
+  renderItemsList();
+}
+// Itens forjados (diferente dos recursos saqueados em `inventory`) com
+// botão de equipar por item — 1 slot só, equipar troca o que tava antes.
+function renderItemsList() {
+  const el = document.getElementById('itemsList');
+  if (!myItems.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="margin-top:6px;opacity:.7">ITENS FORJADOS</div>' + myItems.map(it => {
+    const label = ITEM_LABELS[it.type] || it.type;
+    const equipped = it.id === equippedItemId;
+    return `<div class="itemRow"><span>${label}${equipped ? ' ⚔️' : ''}</span>` +
+      (equipped ? '' : `<button class="equipBtn" data-id="${it.id}">Equipar</button>`) +
+      `</div>`;
+  }).join('');
+  el.querySelectorAll('.equipBtn').forEach(btn => {
+    btn.addEventListener('click', () => sendAction({ action_type: 'EQUIP', item_id: btn.dataset.id }));
+  });
+}
+function populateItemTypeSelect() {
+  const sel = document.getElementById('itemTypeSel');
+  sel.innerHTML = ITEM_TYPES.map(t => `<option value="${t}">${ITEM_LABELS[t]}</option>`).join('');
 }
 
 // Usa o MESMO resultado já calculado este frame para o crosshair (ver loop())
 // — garante que o tiro acerta exatamente o que o jogador via como "alvo válido",
 // nunca um recálculo divergente feito só no clique.
 function shoot() {
-  if (!aimResult.hit || aimResult.type !== 'object' || aimResult.distance > SHOOT_RANGE) {
+  const cooldown = 1 / (currentWeapon.speed || 1);
+  if (clock.elapsedTime - lastShotTime < cooldown) {
+    showToast('Recarregando…');
+    return;
+  }
+  if (!aimResult.hit || aimResult.type !== 'object' || aimResult.distance > currentWeapon.range) {
     showToast('Sem alvo');
     return;
   }
   const oid = structureId(aimResult.cellCx, aimResult.cellCz);
   if (localModified.has(oid)) { showToast('Já destruído'); return; }
+  lastShotTime = clock.elapsedTime;
   sendAction({ action_type: 'SHOOT', target_id: oid, target_tags: ['destruivel', 'hostil'] });
 }
 
@@ -1027,6 +1170,10 @@ document.getElementById('fuseBtn').addEventListener('click', () => {
   btn.disabled = true;
   changeStyle(sel);
   setTimeout(() => { btn.disabled = false; }, 1600);
+});
+document.getElementById('forgeBtn').addEventListener('click', () => {
+  const type = document.getElementById('itemTypeSel').value;
+  sendAction({ action_type: 'FORGE', item_type: type });
 });
 
 // ─── Loop ───────────────────────────────────────────────────
@@ -1149,8 +1296,10 @@ function loop() {
 
   // Mira: mesmo raio do centro da tela (crosshair) que o shader desenharia
   // em uv=(0,0) — ro=câmera, rd=forward. Resultado fica cacheado pro shoot()
-  // não recalcular nada divergente no clique.
-  aimResult = raycastScene(player.pos, getForward(), SHOOT_RANGE);
+  // não recalcular nada divergente no clique. Alcance é o da arma equipada
+  // (currentWeapon.range) — troca de arma muda o que dá pra mirar, não só
+  // o que dá pra atirar.
+  aimResult = raycastScene(player.pos, getForward(), currentWeapon.range);
   xhairEl.classList.toggle('target', aimResult.hit && aimResult.type === 'object');
 
   // Só importa recalcular "quais células destruídas estão perto" quando o
@@ -1199,6 +1348,7 @@ addEventListener('resize', () => {
 
 connect();
 renderInventory();
+populateItemTypeSelect();
 syncWorldUniforms(currParams);
 // Posiciona o player na altura correta do terreno antes de começar
 buildHeightmap(player.pos.x, player.pos.z, currParams);
