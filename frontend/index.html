@@ -150,14 +150,31 @@ const uniforms = {
 
 function syncDestroyedUniform() {
   const arr = uniforms.u_destroyedCells.value;
-  let i = 0;
-  for (const key of destroyedCells) {
-    if (i >= MAX_DESTROYED) break;
-    const [cx, cz] = key.split(',').map(Number);
-    arr[i].set(cx, cz);
-    i++;
+  if (destroyedCells.size <= MAX_DESTROYED) {
+    let i = 0;
+    for (const key of destroyedCells) {
+      const [cx, cz] = key.split(',').map(Number);
+      arr[i].set(cx, cz);
+      i++;
+    }
+    uniforms.u_destroyedCount.value = i;
+    return;
   }
-  uniforms.u_destroyedCount.value = i;
+  // Sessão longa o bastante pra passar de MAX_DESTROYED estruturas mortas:
+  // não cabe mais a história inteira no array do shader. Sem isso, o antigo
+  // "preenche os primeiros 64 do Set" travava esses slots pra sempre — a
+  // 65ª estrutura morta nunca mais entrava no uniform e continuava sendo
+  // DESENHADA como viva (já tinha caído da colisão/raycast em JS), quebrando
+  // a garantia de render+física sincronizados. Manda as células mais perto
+  // do jogador — são as únicas que realmente aparecem em tela (u_far=220).
+  const px = player.pos.x, pz = player.pos.z;
+  const sorted = Array.from(destroyedCells, key => {
+    const [cx, cz] = key.split(',').map(Number);
+    const dx = (cx + 0.5) * OBJ_CELL - px, dz = (cz + 0.5) * OBJ_CELL - pz;
+    return { cx, cz, d2: dx * dx + dz * dz };
+  }).sort((a, b) => a.d2 - b.d2);
+  for (let i = 0; i < MAX_DESTROYED; i++) arr[i].set(sorted[i].cx, sorted[i].cz);
+  uniforms.u_destroyedCount.value = MAX_DESTROYED;
 }
 function markCellDestroyed(cx, cz) {
   const key = cx + ',' + cz;
@@ -856,7 +873,11 @@ function wsUrl() {
   const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const h = location.host;
   if (h.includes('.app.github.dev')) {
-    const fh = h.replace(/^([^-]+)-\d+(.app\.github\.dev.*)$/, '$1-8000$2');
+    // Nomes de Codespace quase sempre têm vários hifens (ex:
+    // "determined-hamilton-scuhqh"), então só o ÚLTIMO "-<porta>" antes do
+    // domínio é a porta — usar "[^-]+" no início (1 hifen só) não casava
+    // com esses nomes e o replace virava no-op (URL ficava com a porta errada).
+    const fh = h.replace(/^(.+)-\d+(\.app\.github\.dev.*)$/, '$1-8000$2');
     return `wss://${fh}/ws/${PLAYER_ID}`;
   }
   return `${p}//${h}/ws/${PLAYER_ID}`;
@@ -993,7 +1014,7 @@ document.getElementById('fuseBtn').addEventListener('click', () => {
 
 // ─── Loop ───────────────────────────────────────────────────
 const clock = new THREE.Clock();
-let fpsT = 0, fpsCount = 0, moveSendT = 0;
+let fpsT = 0, fpsCount = 0, moveSendT = 0, destroyedResyncT = 0;
 
 // Resolução adaptativa — ajusta qualidade para manter FPS fluido
 let currentScale = Math.min(devicePixelRatio, 1.5);
@@ -1113,6 +1134,17 @@ function loop() {
   // não recalcular nada divergente no clique.
   aimResult = raycastScene(player.pos, getForward(), SHOOT_RANGE);
   xhairEl.classList.toggle('target', aimResult.hit && aimResult.type === 'object');
+
+  // Só importa recalcular "quais células destruídas estão perto" quando o
+  // Set não cabe inteiro no uniform (ver syncDestroyedUniform) — caso raro,
+  // por isso throttle de 1s em vez de todo frame.
+  if (destroyedCells.size > MAX_DESTROYED) {
+    destroyedResyncT += dt;
+    if (destroyedResyncT > 1.0) {
+      destroyedResyncT = 0;
+      syncDestroyedUniform();
+    }
+  }
 
   moveSendT += dt;
   if (moveSendT > 0.1) {

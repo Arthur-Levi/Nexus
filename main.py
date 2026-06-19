@@ -374,6 +374,9 @@ class ConnectionManager:
     async def disconnect(self, pid: str):
         async with self._lock:
             self._conns.pop(pid, None)
+        # player_id é aleatório por sessão de página — sem isso, rate_store
+        # acumula uma entrada por visita pra sempre num servidor de longa duração.
+        rate_store.pop(pid, None)
 
     def get_state(self, pid: str) -> PlayerState:
         if pid not in self._states:
