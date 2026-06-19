@@ -443,10 +443,16 @@ const fragmentShader = `
     // (forward/right/up) — sem isso, a arma ficaria "presa" no mundo em vez
     // de na mão do jogador. É só mais um SDF na união: não afeta colisão
     // física (essa usa heightmap+cilindros em JS, nunca este map()).
+    //
+    // O offset forward precisa ser grande o bastante relativo ao tamanho do
+    // modelo (~0.4-0.8 unidades) pra projeção (fwd*1.3 em main(), abaixo)
+    // não estourar a arma pra fora da tela: com forward=0.55 (valor antigo)
+    // a arma ocupava praticamente a tela inteira. right/up escalam junto
+    // com forward pra manter o mesmo canto (inferior-direito) na projeção.
     vec3 camFwd=normalize(u_cameraDir);
     vec3 camRight=normalize(cross(vec3(0,1,0),camFwd));
     vec3 camUp=cross(camFwd,camRight);
-    vec3 wOff=p-(u_cameraPosition+camFwd*0.55+camRight*0.26-camUp*0.20);
+    vec3 wOff=p-(u_cameraPosition+camFwd*2.2+camRight*0.68-camUp*0.50);
     vec3 wLocal=vec3(dot(wOff,camRight),dot(wOff,camUp),dot(wOff,camFwd));
     float weapon=weaponSDF(wLocal,u_weaponType);
 
