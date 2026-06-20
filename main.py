@@ -540,32 +540,35 @@ class SemanticEngine:
 # ════════════════════════════════════════════════════════════
 class ConnectionManager:
     def __init__(self):
-        self._conns: dict[str, WebSocket] = {}
+        # Um pid pode ter MAIS DE UMA conexão viva ao mesmo tempo (duas abas
+        # do navegador com o mesmo player_id, já que o id é persistido no
+        # localStorage — basta abrir o jogo de novo sem fechar a aba antiga).
+        # Por isso um set por pid, não uma websocket só: com uma só, a aba
+        # nova sobrescrevia o registro da aba velha e send() passava a
+        # mandar TODA resposta (FORGE/SHOOT/dano) só pra aba nova — a aba
+        # velha continuava agindo (mutando o PlayerState, que é compartilhado
+        # pelo pid) mas nunca via nenhuma resposta, parecendo travada.
+        self._conns: dict[str, set[WebSocket]] = defaultdict(set)
         self._states: dict[str, PlayerState] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self, pid: str, ws: WebSocket):
         await ws.accept()
         async with self._lock:
-            self._conns[pid] = ws
+            self._conns[pid].add(ws)
             if pid not in self._states:
                 self._states[pid] = PlayerState(pid)
 
     async def disconnect(self, pid: str, ws: WebSocket):
         async with self._lock:
-            # Só remove se a conexão registrada AGORA pra esse pid ainda for
-            # ESTA websocket — sem isso, reconectar rápido com o mesmo
-            # player_id (exatamente o que um F5 faz, já que o id agora é
-            # persistido no localStorage) é uma corrida: a conexão nova
-            # registra primeiro, e o cleanup da conexão velha (que só roda
-            # depois, quando seu loop percebe o close) apagava a entrada da
-            # conexão NOVA por engano — o cliente reconectado nunca mais
-            # recebia nada do servidor, silenciosamente.
-            if self._conns.get(pid) is ws:
+            self._conns[pid].discard(ws)
+            if not self._conns[pid]:
                 self._conns.pop(pid, None)
-        # player_id é aleatório por sessão de página — sem isso, rate_store
-        # acumula uma entrada por visita pra sempre num servidor de longa duração.
-        rate_store.pop(pid, None)
+                # player_id é aleatório por sessão de página — sem isso,
+                # rate_store acumula uma entrada por visita pra sempre num
+                # servidor de longa duração. Só limpa quando a ÚLTIMA aba
+                # desse pid cai, pra não zerar o limite de outra aba ainda viva.
+                rate_store.pop(pid, None)
 
     def get_state(self, pid: str) -> PlayerState:
         if pid not in self._states:
@@ -573,12 +576,18 @@ class ConnectionManager:
         return self._states[pid]
 
     async def send(self, pid: str, msg: dict):
-        ws = self._conns.get(pid)
-        if ws:
+        # Broadcast pra TODAS as abas vivas desse pid — elas compartilham o
+        # mesmo PlayerState, então todas precisam ver o resultado de qualquer
+        # ação (de qualquer uma delas) pra não ficarem com inventário/score
+        # divergente da que realmente está no servidor.
+        dead = []
+        for ws in list(self._conns.get(pid, ())):
             try:
                 await ws.send_json(msg)
             except Exception:
-                await self.disconnect(pid, ws)
+                dead.append(ws)
+        for ws in dead:
+            await self.disconnect(pid, ws)
 
 
 manager = ConnectionManager()
@@ -610,7 +619,7 @@ async def reconcile_chunk(pid: str, state: PlayerState, x: float, z: float):
 async def health():
     return {
         "status": "ok",
-        "connections": len(manager._conns),
+        "connections": sum(len(s) for s in manager._conns.values()),
         "sessions": len(manager._states),
         "chunks_stored": await world_store.count_chunks(),
         "persistence": "sqlite",
