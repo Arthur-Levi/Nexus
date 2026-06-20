@@ -3,6 +3,10 @@ nexus_world.db
 nexus_world.db-journal
 nexus_world.db-wal
 nexus_world.db-shm
+nexus_world.db.corrupted-*
+
+# Backups locais do banco (ver backup_db_once em main.py)
+backups/
 
 # Python
 __pycache__/

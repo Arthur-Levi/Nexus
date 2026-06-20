@@ -14,16 +14,34 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 import aiosqlite
 import asyncio
+import glob
 import json
+import logging
+import math
+import os
 import re
+import shutil
 import time
+
+logger = logging.getLogger("nexus")
+logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup — abre o banco e cria as tabelas
+    # Startup — abre o banco (recriando do zero se estiver corrompido, ver
+    # WorldStore.init) e cria as tabelas
     await world_store.init()
+    # Backup periódico em background — ver periodic_backup_task. Existe
+    # porque um nexus_world.db já foi apagado por engano durante uma sessão
+    # de testes (sem mecanismo de proteção nenhum até agora).
+    backup_task = asyncio.create_task(periodic_backup_task())
     yield
-    # Shutdown — fecha o banco com segurança
+    # Shutdown — encerra o backup periódico e fecha o banco com segurança
+    backup_task.cancel()
+    try:
+        await backup_task
+    except asyncio.CancelledError:
+        pass
     await world_store.close()
 
 
@@ -47,6 +65,56 @@ FRONTEND_PATH = "frontend/index.html"
 CHUNK_SIZE = 16.0   # unidades por chunk (malha 2D no plano XZ)
 OBJ_CELL = 48.0      # tamanho da célula de estrutura — mesmo valor de OBJ_CELL no frontend
 DB_PATH = "nexus_world.db"
+BACKUP_DIR = "backups"
+BACKUP_INTERVAL = 15 * 60  # segundos entre snapshots automáticos
+BACKUP_KEEP = 10           # quantos snapshots manter (os mais antigos são descartados)
+
+
+def backup_db_once(db_path: str = DB_PATH, backup_dir: str = BACKUP_DIR, keep: int = BACKUP_KEEP) -> Optional[str]:
+    """Copia o .db atual pra backups/nexus_world_<timestamp>.db e descarta
+    os mais antigos além de `keep`. Síncrono de propósito (cópia de arquivo
+    é barata e rápida) — chamado tanto pela task periódica (via
+    asyncio.to_thread, pra não bloquear o loop de eventos) quanto pelo
+    script manual tools/backup_db.py, pra nunca duplicar essa lógica.
+    Retorna o caminho do backup criado, ou None se ainda não havia banco
+    pra copiar (não é erro — só não tem o que proteger ainda)."""
+    if not os.path.exists(db_path):
+        return None
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(backup_dir, f"nexus_world_{stamp}.db")
+    # Backup manual + task periódica podem, em tese, cair no mesmo segundo
+    # (granularidade do timestamp) — sem isso, o segundo a chegar sobrescrevia
+    # o arquivo do primeiro em vez de criar um snapshot novo.
+    suffix = 1
+    while os.path.exists(dest):
+        dest = os.path.join(backup_dir, f"nexus_world_{stamp}_{suffix}.db")
+        suffix += 1
+    shutil.copy2(db_path, dest)
+    existing = sorted(glob.glob(os.path.join(backup_dir, "nexus_world_*.db")))
+    for old in existing[:-keep]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return dest
+
+
+async def periodic_backup_task():
+    """Roda em background a vida toda do processo: um snapshot imediato no
+    boot (cobre o caso de o servidor cair antes do primeiro intervalo) e
+    depois um a cada BACKUP_INTERVAL segundos. Não substitui o script manual
+    (tools/backup_db.py) — é a rede de segurança pro cenário que já nos
+    pegou uma vez nesta sessão: apagar/corromper o .db sem ter rodado
+    nenhum backup manual antes."""
+    while True:
+        try:
+            path = await asyncio.to_thread(backup_db_once)
+            if path:
+                logger.info(f"[backup] snapshot salvo em {path}")
+        except Exception as e:
+            logger.warning(f"[backup] falhou: {e}")
+        await asyncio.sleep(BACKUP_INTERVAL)
 
 # ════════════════════════════════════════════════════════════
 # FORGE DE ITENS — catálogo predefinido (sem IA generativa ainda)
@@ -118,6 +186,19 @@ class ActionPayload(BaseModel):
             raise ValueError("world_style deve ser 0, 1 ou 2")
         return v
 
+    @field_validator("position")
+    @classmethod
+    def valid_position(cls, v):
+        # NaN/Infinity passariam por aqui sem isso e seriam rebroadcastados
+        # pra outros jogadores; um valor não-serializável dentro do broadcast
+        # faz _safe_send tratar o envio a CADA outro jogador como "falhou" e
+        # desconectá-los — efeito colateral grave de um payload malformado
+        # de UM jogador só. Rejeitar aqui devolve um ERROR normal pro emissor
+        # em vez disso.
+        if v is not None and (len(v) != 3 or not all(math.isfinite(x) for x in v)):
+            raise ValueError("position deve ter exatamente 3 números finitos")
+        return v
+
 
 # ════════════════════════════════════════════════════════════
 # CHUNK SYSTEM — persistência em malha 2D
@@ -162,7 +243,28 @@ class WorldStore:
         self._lock = asyncio.Lock()
 
     async def init(self):
-        """Cria a conexão e a tabela. Chamado no startup."""
+        """Cria a conexão e as tabelas. Chamado no startup. Se o arquivo
+        existir mas não for um SQLite válido (corrompido — disco cheio
+        truncando o arquivo, cópia interrompida, etc.), move ele de lado em
+        vez de deixar o startup inteiro quebrar: o servidor sempre sobe com
+        um mundo (vazio, nesse caso) em vez de nunca subir."""
+        try:
+            await self._open_and_migrate()
+        except aiosqlite.Error as e:
+            if self._db:
+                await self._db.close()
+                self._db = None
+            if os.path.exists(self.db_path):
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                corrupted_path = f"{self.db_path}.corrupted-{stamp}"
+                os.rename(self.db_path, corrupted_path)
+                logger.warning(
+                    f"[world_store] banco corrompido ({e}) — movido para "
+                    f"'{corrupted_path}'. Recriando um banco limpo em '{self.db_path}'."
+                )
+            await self._open_and_migrate()
+
+    async def _open_and_migrate(self):
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("""
@@ -552,42 +654,84 @@ class ConnectionManager:
         self._states: dict[str, PlayerState] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, pid: str, ws: WebSocket):
+    async def connect(self, pid: str, ws: WebSocket) -> bool:
+        """Retorna True se esta é a PRIMEIRA conexão viva deste pid — é esse
+        momento (não cada aba nova) que deve virar um PLAYER_JOINED pros
+        outros, já que múltiplas abas do mesmo pid são o MESMO jogador
+        (compartilham PlayerState, ver comentário da classe)."""
         await ws.accept()
         async with self._lock:
+            is_new_presence = len(self._conns.get(pid, ())) == 0
             self._conns[pid].add(ws)
             if pid not in self._states:
                 self._states[pid] = PlayerState(pid)
+        return is_new_presence
 
-    async def disconnect(self, pid: str, ws: WebSocket):
+    async def disconnect(self, pid: str, ws: WebSocket) -> bool:
+        """Retorna True se esta foi a ÚLTIMA conexão viva deste pid — só
+        nesse caso o jogador "saiu de verdade" e os outros devem ver um
+        PLAYER_LEFT (fechar uma de duas abas não tira o jogador de cena).
+
+        Idempotente de propósito: _safe_send chama isso quando um
+        broadcast/send falha pra uma conexão já morta, e o `finally` do
+        handler principal chama de novo pra MESMA (pid, ws) quando o loop de
+        recepção dele também percebe a queda — as duas coisas podem
+        acontecer pra a mesma desconexão. Sem o `self._conns.get(pid)` aqui,
+        a segunda chamada recriava a entrada (defaultdict) e devolvia True
+        de novo, mandando um PLAYER_LEFT duplicado."""
         async with self._lock:
-            self._conns[pid].discard(ws)
-            if not self._conns[pid]:
+            conns = self._conns.get(pid)
+            if conns is None or ws not in conns:
+                return False  # já foi limpo por uma chamada anterior
+            conns.discard(ws)
+            if not conns:
                 self._conns.pop(pid, None)
                 # player_id é aleatório por sessão de página — sem isso,
                 # rate_store acumula uma entrada por visita pra sempre num
                 # servidor de longa duração. Só limpa quando a ÚLTIMA aba
                 # desse pid cai, pra não zerar o limite de outra aba ainda viva.
                 rate_store.pop(pid, None)
+                return True
+        return False
 
     def get_state(self, pid: str) -> PlayerState:
         if pid not in self._states:
             self._states[pid] = PlayerState(pid)
         return self._states[pid]
 
+    def list_players(self, exclude_pid: Optional[str] = None) -> list[dict]:
+        """Snapshot de quem está conectado agora (um por pid, não por aba) —
+        mandado pro jogador que acabou de entrar, pra ele não "perder" quem
+        já estava lá antes do primeiro PLAYER_JOINED que ele vai receber."""
+        return [
+            {"player_id": pid, "position": self._states[pid].position}
+            for pid in self._conns
+            if pid != exclude_pid and pid in self._states
+        ]
+
+    async def _safe_send(self, pid: str, ws: WebSocket, msg: dict) -> None:
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            await self.disconnect(pid, ws)
+
     async def send(self, pid: str, msg: dict):
-        # Broadcast pra TODAS as abas vivas desse pid — elas compartilham o
+        # Manda pra TODAS as abas vivas desse pid — elas compartilham o
         # mesmo PlayerState, então todas precisam ver o resultado de qualquer
         # ação (de qualquer uma delas) pra não ficarem com inventário/score
         # divergente da que realmente está no servidor.
-        dead = []
         for ws in list(self._conns.get(pid, ())):
-            try:
-                await ws.send_json(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            await self.disconnect(pid, ws)
+            await self._safe_send(pid, ws, msg)
+
+    async def broadcast(self, msg: dict, exclude_pid: Optional[str] = None):
+        # Pra TODOS os pids conectados, exceto exclude_pid (todas as abas
+        # dele) — usado pra presença/posição de jogadores remotos, nunca
+        # ecoa de volta pro próprio jogador que disparou o evento.
+        for pid, conns in list(self._conns.items()):
+            if pid == exclude_pid:
+                continue
+            for ws in list(conns):
+                await self._safe_send(pid, ws, msg)
 
 
 manager = ConnectionManager()
@@ -641,7 +785,7 @@ async def serve_index():
 # ════════════════════════════════════════════════════════════
 @app.websocket("/ws/{player_id}")
 async def game_socket(websocket: WebSocket, player_id: str):
-    await manager.connect(player_id, websocket)
+    is_new_presence = await manager.connect(player_id, websocket)
     state = manager.get_state(player_id)
     # Hidrata o inventário forjado a partir do SQLite a cada conexão —
     # cobre tanto reload de página (mesmo player_id no localStorage do
@@ -656,7 +800,35 @@ async def game_socket(websocket: WebSocket, player_id: str):
         "chunk_size": CHUNK_SIZE,
         "item_catalog": ITEM_CATALOG,
         "default_weapon": DEFAULT_WEAPON,
+        # Quem já está no mundo agora — sem isso, um jogador que entra depois
+        # de outros só fica sabendo deles no próximo MOVE de cada um (ou nunca,
+        # se ninguém se mover). Um por pid, não por aba (ver list_players).
+        "players": manager.list_players(exclude_pid=player_id),
     })
+
+    # Só multi-aba do MESMO pid não conta como "jogador novo" pros outros
+    # (ver connect() — eles já sabem desse pid desde a primeira aba dele).
+    if is_new_presence:
+        await manager.broadcast({
+            "status": "PLAYER_JOINED",
+            "player_id": player_id,
+            "position": state.position,
+        }, exclude_pid=player_id)
+
+    # Fase M4 — robustez de reconexão: reconcile_chunk só manda CHUNK_RECONCILE
+    # quando o chunk MUDA (ver lá), mas state.current_chunk sobrevive no
+    # PlayerState entre conexões (nunca é limpo no disconnect). Sem isso, um
+    # cliente que cai e volta SEM trocar de chunk (rede caiu, F5, ou outro
+    # dispositivo entrando direto onde já estava) nunca recebia o estado
+    # salvo do chunk em que já estava — a memória do JS é zerada a cada nova
+    # conexão (recarrega a página ou abre em outra aba/dispositivo), mas o
+    # servidor pensava "ele já sabe disso". Resetar aqui força o reconcile
+    # de novo nesta conexão, mesmo estando no mesmo lugar de antes.
+    state.current_chunk = None
+    try:
+        await reconcile_chunk(player_id, state, state.position[0], state.position[2])
+    except Exception:
+        pass
 
     try:
         while True:
@@ -741,6 +913,14 @@ async def game_socket(websocket: WebSocket, player_id: str):
             if payload.action_type == "MOVE":
                 if payload.position and len(payload.position) == 3:
                     state.position = payload.position
+                    # Broadcast pros outros jogadores verem este se mexer —
+                    # exclude_pid evita eco pra qualquer aba do próprio
+                    # jogador (já throttled a ~10Hz no cliente, ver loop()).
+                    await manager.broadcast({
+                        "status": "PLAYER_MOVED",
+                        "player_id": player_id,
+                        "position": state.position,
+                    }, exclude_pid=player_id)
                     try:
                         await reconcile_chunk(
                             player_id, state,
@@ -757,6 +937,19 @@ async def game_socket(websocket: WebSocket, player_id: str):
             try:
                 result = await engine.resolve(payload, state, world_store)
                 await manager.send(player_id, result)
+                # Destruir/coletar muda o mundo pra TODO MUNDO (a persistência
+                # por chunk já garante isso pra quem entra depois — ver
+                # CHUNK_RECONCILE — isso aqui é só o broadcast em tempo real
+                # pra quem já está no chunk agora). DAMAGED fica de fora de
+                # propósito: não tem representação visual hoje (sem barra de
+                # vida na estrutura), nada pra sincronizar ainda.
+                action_status = {"DESTROYED": "destroyed", "COLLECTED": "collected"}.get(result.get("status"))
+                if action_status:
+                    await manager.broadcast({
+                        "status": "PLAYER_ACTION",
+                        "target_id": result.get("target_id"),
+                        "action_status": action_status,
+                    }, exclude_pid=player_id)
             except Exception as e:
                 await manager.send(player_id, {
                     "status": "ERROR",
@@ -771,7 +964,12 @@ async def game_socket(websocket: WebSocket, player_id: str):
         except Exception:
             pass
     finally:
-        await manager.disconnect(player_id, websocket)
+        is_last_connection = await manager.disconnect(player_id, websocket)
+        if is_last_connection:
+            await manager.broadcast({
+                "status": "PLAYER_LEFT",
+                "player_id": player_id,
+            }, exclude_pid=player_id)
 
 
 if __name__ == "__main__":

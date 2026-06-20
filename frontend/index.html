@@ -138,6 +138,11 @@ const destroyedCells = new Set(); // chave "cx,cz"
 // (mesmo princípio de fonte única: membership é a verdade, tempo é só render).
 const destroyedCellTimes = new Map(); // chave "cx,cz" -> u_time.value
 
+// Limite arquitetural do array fixo de uniforms (ver Fase M2 do CLAUDE.md):
+// 8 jogadores remotos de sobra pro MVP. Escalar muito além disso pediria
+// culling por distância ou outra abordagem de render, não uniforms.
+const MAX_REMOTE_PLAYERS = 8;
+
 const uniforms = {
   u_time:           { value: 0.0 },
   u_resolution:     { value: new THREE.Vector2(innerWidth, innerHeight) },
@@ -175,6 +180,11 @@ const uniforms = {
   // (ver comentário em shoot()). -999 nunca fica "perto" de u_time, então
   // não anima nada antes do primeiro ataque.
   u_attackTime:   { value: -999.0 },
+  // Jogadores remotos (Fase M2) — posição do OLHO (mesma convenção de
+  // player.pos), interpolada suavemente no cliente (ver updateRemotePlayers)
+  // antes de subir aqui; o shader subtrai PLAYER_EYE_HEIGHT pra achar os pés.
+  u_remotePlayerCount: { value: 0 },
+  u_remotePlayers:     { value: Array.from({ length: MAX_REMOTE_PLAYERS }, () => new THREE.Vector3(1e6, 1e6, 1e6)) },
 };
 
 function syncDestroyedUniform() {
@@ -310,6 +320,8 @@ const fragmentShader = `
   uniform float u_objectType;
   uniform float u_weaponType;
   uniform float u_attackTime;
+  uniform vec3  u_remotePlayers[8];
+  uniform int   u_remotePlayerCount;
 
   const int   MAX_STEPS = 80;
   const float SURF_DIST = 0.03;
@@ -383,6 +395,32 @@ const fragmentShader = `
   float sdBox(vec3 p, vec3 b){
     vec3 d=abs(p)-b;
     return length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0);
+  }
+
+  // Cápsula vertical (IQ) — avatar dos jogadores remotos (Fase M2). Sem
+  // rotação: simétrica em torno do eixo Y, então orientação da câmera de
+  // quem está remoto não importa pra desenhar (decisão consciente pra não
+  // precisar mandar yaw pela rede ainda — "básico" por enquanto).
+  float sdCapsuleVert(vec3 p, float h, float r){
+    p.y-=clamp(p.y,0.0,h);
+    return length(p)-r;
+  }
+  // PLAYER_EYE_HEIGHT precisa bater com physics.eyeHeight (JS): a posição
+  // que chega pela rede é a do OLHO da câmera (igual a player.pos), não dos
+  // pés — sem subtrair isso a cápsula flutuaria ~2.5u acima do chão. Raio
+  // bate com PLAYER_RADIUS (colisão em JS); altura é só estética (a Fase M2
+  // não inclui colisão entre jogadores, só render).
+  const float PLAYER_EYE_HEIGHT=2.5;
+  const float PLAYER_CAPSULE_H=1.4;
+  const float PLAYER_CAPSULE_R=0.4;
+  float remotePlayersSDF(vec3 p){
+    float d=1.0e5;
+    for(int i=0;i<8;i++){
+      if(i>=u_remotePlayerCount) break;
+      vec3 feet=u_remotePlayers[i]-vec3(0.0,PLAYER_EYE_HEIGHT,0.0);
+      d=min(d, sdCapsuleVert(p-feet, PLAYER_CAPSULE_H, PLAYER_CAPSULE_R));
+    }
+    return d;
   }
 
   // Forma do objeto — eixo independente do terreno (u_objectType escolhe a
@@ -508,7 +546,8 @@ const fragmentShader = `
     vec3 wLocal=vec3(dot(wOff,camRight),dot(wOff,camUp),dot(wOff,camFwd));
     float weapon=weaponSDF(wLocal,u_weaponType);
 
-    return min(min(ground, obj), weapon);
+    float players=remotePlayersSDF(p);
+    return min(min(min(ground, obj), weapon), players);
   }
 
   vec3 calcNormal(vec3 p){
@@ -585,6 +624,14 @@ const fragmentShader = `
       vec3 p=ro+rd*d;
       vec3 n=calcNormal(p);
       vec3 albedo=terrainColor(p,n,u_colorLow,u_colorHigh,u_colorSlope);
+      // Avatar de jogador remoto: albedo fixo (cor de marca) em vez do
+      // gradiente de terreno — sem isso ficaria camuflado com o chão ao
+      // redor. Mesma tolerância de convergência do rayMarch (ver lá), pra
+      // "é isso que bateu?" usar o mesmo critério de "superfície" do resto
+      // do motor.
+      if(remotePlayersSDF(p) < SURF_DIST*(1.0+d*0.05)){
+        albedo=vec3(0.0,1.0,0.8);
+      }
 
       float diff=clamp(dot(n,sunDir),0.0,1.0);
       // Sombra só nos objetos próximos (longe não compensa o custo)
@@ -997,6 +1044,28 @@ let ws = null, reconnDelay = 1000, reconnTimer = null;
 let inventory = {}, score = 0, health = 100, chunkSize = 16;
 const localModified = new Set();
 
+// ─── Multiplayer básico (Fase M1/M2 — presença, movimento e render) ──
+// Um por player_id (nunca o nosso próprio — o servidor já exclui via
+// exclude_pid no broadcast). `position` é o último valor recebido da rede
+// (chega a ~10Hz, no ritmo do MOVE); `displayPos` é a posição de fato
+// desenhada, interpolada suavemente em cada frame (ver updateRemotePlayers)
+// pra não "saltar" entre updates — sem isso o avatar teleportaria 10x/s
+// em vez de andar.
+const remotePlayers = new Map(); // player_id -> { position: [x,y,z], displayPos?: THREE.Vector3 }
+const _remoteScratch = new THREE.Vector3(); // evita alocar um Vector3 por jogador por frame
+function updateRemotePlayers(dt) {
+  let i = 0;
+  for (const rp of remotePlayers.values()) {
+    if (i >= MAX_REMOTE_PLAYERS) break; // limite do array fixo de uniforms (ver declaração)
+    if (!rp.displayPos) rp.displayPos = new THREE.Vector3(...rp.position);
+    _remoteScratch.set(rp.position[0], rp.position[1], rp.position[2]);
+    rp.displayPos.lerp(_remoteScratch, Math.min(1, 10 * dt));
+    uniforms.u_remotePlayers.value[i].copy(rp.displayPos);
+    i++;
+  }
+  uniforms.u_remotePlayerCount.value = Math.min(remotePlayers.size, MAX_REMOTE_PLAYERS);
+}
+
 // ─── Forge de Itens ─────────────────────────────────────────
 // ITEM_TYPES fixa a ordem == índice da forma no shader (u_weaponType);
 // é o único dado de tipo que precisa existir nos dois lados (servidor
@@ -1081,6 +1150,44 @@ function onServerMsg(d) {
       if (d.item_catalog) itemCatalog = d.item_catalog;
       if (d.default_weapon) defaultWeapon = d.default_weapon;
       if (d.player_state) applyState(d.player_state);
+      if (Array.isArray(d.players)) {
+        // Merge, não clear+rebuild: uma segunda aba do MESMO jogador também
+        // recebe este CONNECTED (manager.send manda pra todas as abas do
+        // pid) — um clear() aqui descartaria o displayPos (suavização do
+        // lerp) de quem já estava sendo desenhado na aba antiga, causando
+        // um "snap" visual nela só porque outra aba conectou.
+        const seen = new Set(d.players.map(p => p.player_id));
+        for (const pid of remotePlayers.keys()) {
+          if (!seen.has(pid)) remotePlayers.delete(pid);
+        }
+        d.players.forEach(p => {
+          const existing = remotePlayers.get(p.player_id);
+          if (existing) existing.position = p.position;
+          else remotePlayers.set(p.player_id, { position: p.position });
+        });
+      }
+      break;
+    case 'PLAYER_JOINED':
+      remotePlayers.set(d.player_id, { position: d.position });
+      break;
+    case 'PLAYER_MOVED':
+      if (remotePlayers.has(d.player_id)) {
+        remotePlayers.get(d.player_id).position = d.position;
+      } else {
+        // Pode chegar antes do PLAYER_JOINED em teoria (mesma ordem de
+        // broadcast no servidor torna isso raro, mas não custa ser robusto).
+        remotePlayers.set(d.player_id, { position: d.position });
+      }
+      break;
+    case 'PLAYER_LEFT':
+      remotePlayers.delete(d.player_id);
+      break;
+    case 'PLAYER_ACTION':
+      // Outro jogador destruiu/coletou algo — reusa a MESMA função que já
+      // aplica isso quando fomos NÓS (DESTROYED/COLLECTED abaixo) ou quando
+      // o servidor reconcilia um chunk antigo: um objeto destruído some do
+      // mundo do mesmo jeito, não importa quem o destruiu.
+      if (d.target_id && d.action_status) applyPersistedState(d.target_id, { status: d.action_status });
       break;
     case 'DESTROYED':
       // Sem toast aqui de propósito: a própria estrutura afundando/encolhendo
@@ -1357,6 +1464,7 @@ function loop() {
 
   uniforms.u_cameraPosition.value.copy(player.pos);
   uniforms.u_cameraDir.value.copy(getForward());
+  updateRemotePlayers(dt);
 
   // Mira: mesmo raio do centro da tela (crosshair) que o shader desenharia
   // em uv=(0,0) — ro=câmera, rd=forward. Resultado fica cacheado pro shoot()

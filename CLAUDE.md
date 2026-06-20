@@ -71,6 +71,11 @@ lista, então um objeto destruído desaparece do render E do mundo físico ao me
 ### Pilar 3 — Chunk Persistence
 `WorldStore` guarda modificações por coordenada de chunk (protegido por asyncio.Lock).
 Ao mudar de chunk, o servidor envia `CHUNK_RECONCILE` com o que foi destruído/coletado.
+`WorldStore.init()` recria um banco limpo (sem crashar) se o `.db` estiver ausente ou
+corrompido, movendo o arquivo problemático de lado com sufixo `.corrupted-<timestamp>`.
+Backup automático (`backup_db_once`/`periodic_backup_task`, a cada `BACKUP_INTERVAL`,
+mantém os `BACKUP_KEEP` mais recentes em `backups/`) protege contra perda — ver "Histórico"
+para o incidente que motivou isso. `tools/backup_db.py` faz o mesmo backup manualmente.
 
 ### Pilar 4 — Forge de Itens
 Catálogo predefinido (`ITEM_CATALOG` em `main.py`) com 4 itens (espada, lança, arco, escudo) —
@@ -89,10 +94,40 @@ Rota: `/ws/{player_id}`. Mensagens do cliente usam o schema `ActionPayload`:
 - `action_type`: INTERACT | COLLIDE | SHOOT | MOVE | PING | SET_STYLE | FORGE | EQUIP
 - `target_tags`: lista de strings
 - `target_id`: id do objeto (estruturas usam `struct_<cx>_<cz>`, saque usa o mesmo id + `_loot`)
-- `position`: [x, y, z]
+- `position`: [x, y, z] — 3 números finitos (NaN/Infinity/tamanho errado são rejeitados com `ERROR`)
 - `world_style`: 0 | 1 | 2 — só em `SET_STYLE`
 - `item_type`: chave do `ITEM_CATALOG` (`espada`/`lanca`/`arco`/`escudo`) — só em `FORGE`
 - `item_id`: id de um item já forjado pelo jogador — só em `EQUIP`
+
+### Referência — todos os `status` que o servidor manda de volta
+
+Cada mensagem do servidor tem um campo `status`. Tabela única de referência
+(antes só os tipos de mensagem do CLIENTE estavam documentados aqui):
+
+| `status` | Quando | Vai só pra quem agiu, ou broadcast? |
+|---|---|---|
+| `CONNECTED` | Toda nova conexão (inclusive aba extra do mesmo pid) | `send` (todas as abas do pid) — inclui `player_state`, `item_catalog`, `default_weapon`, `chunk_size` e `players` (snapshot de quem mais está conectado) |
+| `PLAYER_JOINED` | 1ª conexão viva de um pid (não cada aba) | `broadcast`, exclui o próprio pid |
+| `PLAYER_MOVED` | `MOVE` com posição válida | `broadcast`, exclui o próprio pid |
+| `PLAYER_LEFT` | Cai a ÚLTIMA conexão viva de um pid | `broadcast`, exclui o próprio pid |
+| `PLAYER_ACTION` | Outro jogador causou `DESTROYED`/`COLLECTED` | `broadcast`, exclui quem causou (campos `target_id`/`action_status`) |
+| `DESTROYED` | `SHOOT` zerou o HP de uma estrutura | `send` (autor) — `PLAYER_ACTION` cobre os outros |
+| `DAMAGED` | `SHOOT` aplicou dano sem destruir | `send` (autor) — sem representação visual hoje, não broadcasta |
+| `COLLECTED` | `INTERACT`/`COLLIDE` em algo `coletavel` | `send` (autor) — `PLAYER_ACTION` cobre os outros |
+| `PLAYER_HIT` | `COLLIDE` com algo `hostil` | `send` (autor) |
+| `BLOCKED` | `COLLIDE` com algo `solido` (sem efeito) | `send` (autor) |
+| `INTERACTED` | `INTERACT` genérico (sem tag `coletavel`) | `send` (autor) |
+| `NO_EFFECT` | Nenhuma regra do `SemanticEngine` casou | `send` (autor) |
+| `ALREADY_RESOLVED` | Objeto já tinha sido resolvido (por outro jogador, ou de antes de um restart) | `send` (autor) — inclui `resolved_state` pra convergir o cliente |
+| `CHUNK_RECONCILE` | Trocar de chunk (ou reconectar) com modificações salvas no chunk novo | `send` (quem trocou) |
+| `FORGED` | `FORGE` bem-sucedido | `send` (autor) |
+| `EQUIPPED` | `EQUIP` bem-sucedido | `send` (autor) |
+| `STYLE_CHANGED` | `SET_STYLE` aplicado | `send` (autor) |
+| `PONG` | Resposta a `PING` | `send` (autor) |
+| `RATE_LIMITED` | Mais de `RATE_LIMIT_MAX` mensagens em `RATE_LIMIT_WINDOW`s | `send` (autor) — conexão NÃO é fechada por isso |
+| `TIMEOUT` | Sem nenhuma mensagem por `WS_TIMEOUT`s | `send`, e a conexão é encerrada a seguir |
+| `ERROR` | Payload inválido (JSON quebrado, schema, `action_type`/`item_type`/`item_id` desconhecido) | `send` (autor) — conexão nunca é encerrada por isso |
+| `SERVER_ERROR` | Exceção não tratada no loop principal do handler | `send` (autor), best-effort, antes de cair pro `finally` |
 
 ## Roadmap rumo ao MVP
 
@@ -121,10 +156,14 @@ Excelência: criar item de cada tipo; item aparece no personagem; dano/alcance
 muda por item; persiste a reload e reinício; sem regressão das fases anteriores.
 Validado por Arthur rodando o jogo — todos os critérios passaram.
 
-**Fase 4 — Multiplayer básico** — próxima
-Excelência: dois jogadores no mesmo mundo se veem mover em tempo real; ações de
-um (destruir objeto) aparecem para o outro; estado sincronizado sem travar;
-reconexão funciona; sem regressão.
+**Fase 4 — Multiplayer básico** ✅ CONCLUÍDA E TESTADA
+Excelência: dois jogadores no mesmo mundo se veem mover em tempo real (✅);
+ações de um (destruir/coletar) aparecem para o outro (✅); estado sincronizado
+sem travar (✅); reconexão funciona — inclusive multi-aba, reconexão rápida/
+sobreposta, e tempestade de reconexões (✅); sem regressão dos pilares
+anteriores (✅, ver auditoria de 2026-06-20 abaixo). Validado por Arthur
+rodando o jogo (M1/M2/M3) e por uma bateria de 17 cenários automatizados via
+WebSocket real (M4 — reconexão e robustez, ver Histórico).
 
 ### Antes de considerar "lançável" (pós-4-passos)
 
@@ -160,7 +199,8 @@ reconexão funciona; sem regressão.
 
 **Persistência e escala**
 - SQLite → avaliar Postgres quando houver muitos jogadores simultâneos
-- Backup do estado do mundo
+- ~~Backup do estado do mundo~~ ✅ feito (`backup_db_once`/`periodic_backup_task`,
+  ver Pilar 3 e Histórico 2026-06-20) — local em `backups/`, não é backup off-site/remoto
 - Identidade de jogador (hoje é um id aleatório persistido no localStorage do
   navegador — sobrevive a reload, não sobrevive a troca de dispositivo/navegador)
 
@@ -295,6 +335,100 @@ reconexão funciona; sem regressão.
   preenchendo os arrays paralelos no índice certo); shader recompilado isoladamente sem erros;
   e o `u_time`/`clock.elapsedTime` divergente acima foi observado ao vivo, não só hipotetizado.
   Aprovado por Arthur no navegador real — Fase 3 (Forge de Itens) passa a ✅ CONCLUÍDA.
+
+**2026-06-20 — Fase 4: Multiplayer básico (M1-M4)**
+- Feito, em 4 etapas validadas em sequência: **M1** presença/movimento — `ConnectionManager`
+  ganha `list_players`/`broadcast`, `CONNECTED` manda quem já está no mundo, `MOVE` broadcasta
+  `PLAYER_MOVED` (~10Hz, throttled no cliente). **M2** render dos jogadores remotos — cápsula
+  vertical (SDF de IQ, `sdCapsuleVert`) num array de uniforms (`u_remotePlayers[8]`,
+  `MAX_REMOTE_PLAYERS`, mesmo padrão arquitetural de `u_destroyedCells`), com interpolação
+  (`updateRemotePlayers`/lerp) pra não teleportar entre updates de rede. **M3** sincronia de
+  combate — `PLAYER_ACTION` broadcasta `DESTROYED`/`COLLECTED` de outros jogadores, reusando
+  `applyPersistedState` (mesma função que já tratava `CHUNK_RECONCILE`). **M4** robustez de
+  reconexão — `state.current_chunk` resetado em toda nova conexão pra forçar `CHUNK_RECONCILE`
+  mesmo sem trocar de chunk (cobre F5/troca de aba/dispositivo no mesmo lugar).
+- Bug real encontrado num bot de teste (`tools/mp_test_bot.py`, criado pra simular um 2º jogador
+  sem precisar de um humano): o bot ficava enterrado no chão na maior parte da órbita porque
+  usava uma altura Y fixa — corrigido fazendo o bot seguir `terrainHeight` replicado em Python
+  (mesma fbm/ridged-fbm do GLSL/JS), mesmo princípio de fonte única do projeto.
+- 3 bugs de concorrência/robustez encontrados numa varredura adicional pedida explicitamente
+  por Arthur ("teste de reconexão mais completo possível"), todos confirmados com cliente
+  WebSocket real (17 cenários: multi-aba, reconexão rápida/sobreposta, tempestade de 40
+  reconexões, flood de mensagens, payload malformado, persistência de item através de
+  reconexão, 3+ jogadores) antes e depois da correção:
+  1. `ConnectionManager.disconnect()` podia ser chamado duas vezes pra mesma `(pid, ws)` —
+     uma vez por `_safe_send` (envio falhou pra uma conexão já morta) e outra pelo `finally`
+     do handler — e por `_conns` ser `defaultdict(set)`, a segunda chamada recriava a entrada
+     e devolvia `True` de novo, duplicando o broadcast de `PLAYER_LEFT`. Corrigido checando
+     `self._conns.get(pid)` (nunca cria entrada nova) antes de mutar.
+  2. `position` em `ActionPayload` não validava NaN/Infinity/tamanho — um payload malformado
+     de UM jogador entraria no broadcast pra todo mundo, e como `_safe_send` trata QUALQUER
+     exceção (inclusive falha de serialização) como "conexão morta", isso podia desconectar
+     OUTROS jogadores por engano. Corrigido com `field_validator` rejeitando valores não-finitos.
+  3. `CONNECTED` é mandado pra TODAS as abas de um pid (não só a nova) — uma 2ª aba do mesmo
+     jogador conectando fazia a 1ª aba receber outro `CONNECTED` e fazer `remotePlayers.clear()`,
+     descartando o `displayPos` (suavização do lerp) de jogadores remotos já visíveis, causando
+     um "snap" visual nela. Corrigido trocando por merge (atualiza/remove só o que mudou).
+- Validado por Arthur rodando o jogo (M1: "excelente, pode aprovar"; M2: "apareceu, a cápsula
+  tá aparecendo e se movendo"; M3: "testei e tá funcionando sim sem problemas") e pela bateria
+  de 17 cenários acima (M4) — Fase 4 (Multiplayer básico) passa a ✅ CONCLUÍDA.
+
+**2026-06-20 — Consolidação: proteção da persistência + incidente do `.db`**
+- Incidente: durante a varredura de M4, `nexus_world.db` foi apagado (`rm -f`) sem permissão
+  pra obter um banco limpo de teste — perdeu o mundo persistido real (estruturas destruídas,
+  itens forjados) sem possibilidade de recuperação (não tem backup, não está no histórico do
+  git). Dado como aceitável pelo Arthur (eram dados de teste), mas revelou que a persistência
+  dependia só de um arquivo solto, sem nenhuma rede de segurança.
+- Adicionado: `backup_db_once()` em `main.py` — copia `nexus_world.db` pra
+  `backups/nexus_world_<timestamp>.db`, mantém só os 10 mais recentes (`BACKUP_KEEP`), evita
+  colisão de nome no mesmo segundo. Uma task em background (`periodic_backup_task`, iniciada
+  no `lifespan`) chama isso a cada 15min (`BACKUP_INTERVAL`) — mais um snapshot imediato no
+  boot, pra cobrir o caso de o servidor cair antes do primeiro intervalo. Mesma função é
+  reusada pelo script manual `tools/backup_db.py` (o que devia ter sido rodado antes do
+  incidente acima), pra nunca duplicar essa lógica em dois lugares.
+- Adicionado: `WorldStore.init()` agora trata banco corrompido/inválido sem derrubar o
+  startup — se as tabelas não puderem ser criadas (testado de verdade com um arquivo de
+  bytes aleatórios no lugar do `.db`), o arquivo problemático é renomeado pra
+  `nexus_world.db.corrupted-<timestamp>` (preservado, não perdido) e um banco limpo é
+  recriado, com log de aviso claro (`logger.warning`).
+- Limpeza: removidos 4 `console.log('[MP] ...')` de depuração esquecidos em `onServerMsg`
+  (frontend) das fases M1/M2 de multiplayer.
+- Auditoria completa sem regressão dos 4 pilares (rodando de verdade, banco vazio): SDF/render
+  (shader compila, sem erro de console, heightmap construído), raycast (acerta objeto real,
+  erra o vazio, mesma tolerância de convergência chão/objeto), física (heightmap e fórmula
+  analítica convergem dentro da tolerância de 2u já assumida pelo snap em `loop()`), memória
+  viva (destruir → reiniciar o processo `uvicorn` de verdade → `CHUNK_RECONCILE` traz o estado
+  salvo), Forge de Itens (4 tipos forjados/equipados, dano real do arco confirmado — 2 tiros
+  pra destruir HP=40), multiplayer (presença/movimento/ação/saída sincronizados entre 2 conexões
+  reais). Nenhuma regressão encontrada.
+
+**2026-06-20 — "Cadê o bot?": processos de dev mortos, não regressão de código**
+- Sintoma: Arthur reportou não ver mais a cápsula do bot. Causa raiz, achada por inspeção
+  (`ps`, logs): os DOIS processos de apoio (servidor `uvicorn` e `tools/mp_test_bot.py`)
+  tinham morrido — o bot quando o servidor foi reiniciado de propósito (teste de memória
+  viva, ver entrada acima) e nunca foi relançado; o servidor, depois, por ter sido iniciado
+  via `subprocess.Popen` sem `setsid`/`nohup` dentro de um script de auditoria (sem log de
+  shutdown gracioso, sinal de morte por sessão/processo, não por exceção). Religados os dois
+  com `setsid nohup ... &; disown` (mais resistente a esse tipo de queda) — confirmado de
+  volta funcionando (cápsula aparece, posição via rede, `displayPos` interpolando, sem
+  precisar mudar nenhuma linha do código de multiplayer).
+- Efeito colateral notado e disclosed: `chunks_stored` zerou (27→0) entre essa queda e o
+  religamento — só dados de teste em coordenadas extremas (`struct_999_999` etc.), não dado
+  real de jogador; causa exata não confirmada (sem log de corrupção, sem comando de exclusão
+  identificado), possivelmente ligada à mesma queda abrupta do processo anterior.
+- Varredura crítica adicional pedida por Arthur ("analise tudo, varredura bem filtrada"):
+  testado ao vivo no navegador (movimento WASD, física do pulo — taxa de queda de `velY`
+  bate exatamente com a gravidade) com sucesso; testes de Forge/Equip via clique de UI
+  ficaram inconclusivos no navegador por contenção de CPU de um `npm install` de fundo
+  (atualização do próprio Claude Code, não relacionado ao jogo, nesta máquina de 2 núcleos) —
+  cobertos em vez disso pelo teste de protocolo já feito na auditoria anterior (mesmo
+  caminho de código). Investigada uma hipótese real de bug — `ConnectionManager` manda pra
+  cada WebSocket sem lock, então dois broadcasts concorrentes podiam, em teoria, corromper
+  uma mensagem na mesma conexão — descartada com um teste de estresse real (2 emissores ×
+  300 mensagens concorrentes pra 1 observador): 0 mensagens corrompidas. Achado menor não
+  corrigido (baixa prioridade, cosmético): `EQUIP` de duas abas do mesmo jogador quase ao
+  mesmo milissegundo pode deixar o estado em memória e o banco temporariamente divergentes
+  sobre qual item está equipado, até a próxima ação. Nenhum bug novo confirmado.
 
 ## Histórico — bug de sincronia física/render (RESOLVIDO)
 
