@@ -116,11 +116,12 @@ respeitado; crosshair indica alvo válido; sem código morto. (9/9 validados)
 Excelência: mundo idêntico após reinício do servidor; múltiplos chunks persistem;
 estados ricos por objeto.
 
-**Fase 3 — Forge de Itens** — implementada, aguardando validação humana
+**Fase 3 — Forge de Itens** ✅ CONCLUÍDA
 Excelência: criar item de cada tipo; item aparece no personagem; dano/alcance
 muda por item; persiste a reload e reinício; sem regressão das fases anteriores.
+Validado por Arthur rodando o jogo — todos os critérios passaram.
 
-**Fase 4 — Multiplayer básico** — próxima (não iniciar antes da Fase 3 ser aprovada)
+**Fase 4 — Multiplayer básico** — próxima
 Excelência: dois jogadores no mesmo mundo se veem mover em tempo real; ações de
 um (destruir objeto) aparecem para o outro; estado sincronizado sem travar;
 reconexão funciona; sem regressão.
@@ -267,6 +268,33 @@ reconexão funciona; sem regressão.
   replicar a matemática em Python puro (sem GPU) foi muito mais rápido e confiável que tentar
   abrir o jogo de verdade num browser headless. Validar compilação do shader isoladamente
   (só `gl.compileShader` num contexto WebGL bare, sem Three.js/jogo) também evita o mesmo travamento.
+
+**2026-06-20 — Ajuste fino pós-feedback: posição, swing dessincronizado, e morte sem animação**
+- Arthur testou no navegador real (a prova em pixel que o sandbox não conseguia dar) e pediu 3
+  ajustes: a arma ainda estava um pouco longe demais pra direita; a animaçãozinha de ataque
+  simplesmente não aparecia; e destruir uma estrutura só mostrava um toast cyan feio em vez de
+  algo visual.
+- Posição: `camRight*0.18` → `camRight*0.08` — mais perto do centro, mesma lógica de evitar
+  `#rightPanels`.
+- Não funcionou (achado real, não só preferência): `u_attackTime` era setado com
+  `clock.elapsedTime`, mas o shader compara contra `u_time` — um acumulador SEPARADO que avança
+  com delta clampado (`Math.min(dt,0.05)` em `loop()`) e dessincroniza de `clock.elapsedTime` a
+  qualquer soluço de frame. Confirmado rodando o app de verdade: nesta sessão `u_time` chegou a
+  ficar em `0.13` enquanto `clock.elapsedTime` já estava em `12.05` — com essa divergência,
+  `u_time - u_attackTime` ficava negativo por muito tempo e a janela de animação (0.22s) quase
+  nunca era atingida. Por isso o swing "não existia" pro Arthur, mesmo a lógica estando
+  conectada. Corrigido pra usar `uniforms.u_time.value` (mesmo relógio do shader) em `shoot()`;
+  janela aumentada pra 0.28s e o jab ficou um pouco maior pra ser mais perceptível.
+- Adicionado: `u_destroyedTimes` (paralelo a `u_destroyedCells`, por índice, preenchido em
+  `markCellDestroyed`/`syncDestroyedUniform`) — a estrutura agora afunda e encolhe por ~1.1s em
+  `map()` (`DESTROY_ANIM`) em vez de desaparecer de um frame pro outro. A colisão em JS continua
+  decidindo só por membership no Set (`destroyedCells`), nunca por esse tempo — mesmo princípio
+  de fonte única já usado pra física/render e pro número de combate. Toast `💥 DESTRUÍDO`
+  removido: a queda visual da própria estrutura já é o feedback.
+- Validado: protocolo WS real (FORGE/EQUIP mudando `u_weaponType`; `markCellDestroyed`
+  preenchendo os arrays paralelos no índice certo); shader recompilado isoladamente sem erros;
+  e o `u_time`/`clock.elapsedTime` divergente acima foi observado ao vivo, não só hipotetizado.
+  Aprovado por Arthur no navegador real — Fase 3 (Forge de Itens) passa a ✅ CONCLUÍDA.
 
 ## Histórico — bug de sincronia física/render (RESOLVIDO)
 
