@@ -132,6 +132,11 @@ hmapTexture.magFilter = THREE.LinearFilter;
 // em JS leem a mesma lista, então o objeto some do render E do mundo físico.
 const MAX_DESTROYED = 64;
 const destroyedCells = new Set(); // chave "cx,cz"
+// Quando cada célula morreu (u_time.value daquele momento) — só pra animação
+// visual de afundar/encolher; a colisão/raycast em JS continua decidindo
+// "pode colidir?" só pela presença em destroyedCells, nunca por este tempo
+// (mesmo princípio de fonte única: membership é a verdade, tempo é só render).
+const destroyedCellTimes = new Map(); // chave "cx,cz" -> u_time.value
 
 const uniforms = {
   u_time:           { value: 0.0 },
@@ -145,6 +150,10 @@ const uniforms = {
   u_heightmap_half:    { value: HMAP_HALF },
   u_destroyedCount:    { value: 0 },
   u_destroyedCells:    { value: Array.from({ length: MAX_DESTROYED }, () => new THREE.Vector2(1e6, 1e6)) },
+  // u_time.value de quando cada célula em u_destroyedCells morreu — paralelo
+  // por índice (mesma ordem) — alimenta a animação de afundar/encolher no
+  // shader (ver map()) em vez do objeto só desaparecer de um frame pro outro.
+  u_destroyedTimes:    { value: new Float32Array(MAX_DESTROYED) },
   // Parâmetros do mundo — universos infinitos definidos por números, não por if(style)
   u_terrainScale: { value: 0.016 },
   u_peakHeight:   { value: 30.0 },
@@ -160,15 +169,23 @@ const uniforms = {
   // Arma equipada (viewmodel) — eixo independente do mundo/objeto, por
   // isso fora de WORLD_PRESETS. 0 = espada (padrão antes de forjar nada).
   u_weaponType:   { value: 0.0 },
+  // u_time.value (não clock.elapsedTime!) do último ataque — alimenta a
+  // animaçãozinha de swing no shader (ver map()). Tem que ser o mesmo
+  // relógio que u_time pra "u_time-u_attackTime" cair na janela certa
+  // (ver comentário em shoot()). -999 nunca fica "perto" de u_time, então
+  // não anima nada antes do primeiro ataque.
+  u_attackTime:   { value: -999.0 },
 };
 
 function syncDestroyedUniform() {
   const arr = uniforms.u_destroyedCells.value;
+  const times = uniforms.u_destroyedTimes.value;
   if (destroyedCells.size <= MAX_DESTROYED) {
     let i = 0;
     for (const key of destroyedCells) {
       const [cx, cz] = key.split(',').map(Number);
       arr[i].set(cx, cz);
+      times[i] = destroyedCellTimes.get(key) ?? 0;
       i++;
     }
     uniforms.u_destroyedCount.value = i;
@@ -187,13 +204,17 @@ function syncDestroyedUniform() {
     const dx = (cx + 0.5) * OBJ_CELL - px, dz = (cz + 0.5) * OBJ_CELL - pz;
     return { cx, cz, d2: dx * dx + dz * dz };
   }).sort((a, b) => a.d2 - b.d2);
-  for (let i = 0; i < MAX_DESTROYED; i++) arr[i].set(sorted[i].cx, sorted[i].cz);
+  for (let i = 0; i < MAX_DESTROYED; i++) {
+    arr[i].set(sorted[i].cx, sorted[i].cz);
+    times[i] = destroyedCellTimes.get(sorted[i].cx + ',' + sorted[i].cz) ?? 0;
+  }
   uniforms.u_destroyedCount.value = MAX_DESTROYED;
 }
 function markCellDestroyed(cx, cz) {
   const key = cx + ',' + cz;
   if (destroyedCells.has(key)) return;
   destroyedCells.add(key);
+  destroyedCellTimes.set(key, uniforms.u_time.value);
   syncDestroyedUniform();
 }
 
@@ -269,6 +290,7 @@ const fragmentShader = `
   uniform vec2  u_heightmap_center;
   uniform float u_heightmap_half;
   uniform vec2  u_destroyedCells[64];
+  uniform float u_destroyedTimes[64];
   uniform int   u_destroyedCount;
 
   // ─── Parâmetros do mundo (universos infinitos) ──────────────
@@ -287,6 +309,7 @@ const fragmentShader = `
   uniform float u_metalness;
   uniform float u_objectType;
   uniform float u_weaponType;
+  uniform float u_attackTime;
 
   const int   MAX_STEPS = 80;
   const float SURF_DIST = 0.03;
@@ -330,12 +353,16 @@ const fragmentShader = `
 
   mat2 rot2(float a){ float c=cos(a),s=sin(a); return mat2(c,-s,s,c); }
 
-  bool cellDestroyed(vec2 cell){
+  // -1 = célula viva. >=0 = segundos desde a destruição, pra animar o
+  // afundar/encolher em map() em vez do objeto só desaparecer de um frame
+  // pro outro (ver Pilar 2 — a colisão em JS continua decidindo só por
+  // membership, esse tempo é puramente visual).
+  float cellDestroyedElapsed(vec2 cell){
     for(int i=0;i<64;i++){
       if(i>=u_destroyedCount) break;
-      if(abs(cell.x-u_destroyedCells[i].x)<0.5 && abs(cell.y-u_destroyedCells[i].y)<0.5) return true;
+      if(abs(cell.x-u_destroyedCells[i].x)<0.5 && abs(cell.y-u_destroyedCells[i].y)<0.5) return u_time-u_destroyedTimes[i];
     }
-    return false;
+    return -1.0;
   }
 
   // Altura do terreno — função única, sem if(style). terrainScale controla a
@@ -431,11 +458,24 @@ const fragmentShader = `
     q.xz=mod(q.xz,48.0)-24.0;
     vec2 cellXZ=floor(p.xz/48.0);
     float obj=1.0e5;
-    if(!cellDestroyed(cellXZ)){
+    // DESTROY_ANIM segundos de afundar+encolher no lugar de só desaparecer
+    // de um frame pro outro — depois disso obj fica 1.0e5 (igual a antes),
+    // barato de pular pra sempre. Substitui o toast "💥 DESTRUÍDO": a queda
+    // visual da própria estrutura já é o feedback.
+    const float DESTROY_ANIM=1.1;
+    float destroyedElapsed=cellDestroyedElapsed(cellXZ);
+    if(destroyedElapsed<DESTROY_ANIM){
       // Centro real do bloco onde o objeto está (não o canto)
       vec2 cellCenter=(cellXZ+0.5)*48.0;
       float baseY=terrainHeight(cellCenter,u_terrainScale,u_peakHeight,u_ridgeAmount,u_craterAmount)+2.0;
-      obj=objectSDF(q-vec3(0.0,baseY,0.0), u_objectType);
+      if(destroyedElapsed<0.0){
+        obj=objectSDF(q-vec3(0.0,baseY,0.0), u_objectType);
+      } else {
+        float p2=destroyedElapsed/DESTROY_ANIM; // 0..1
+        float sinkY=baseY-p2*4.0;
+        float s=max(1.0-p2*0.85,0.05);
+        obj=objectSDF((q-vec3(0.0,sinkY,0.0))/s, u_objectType)*s;
+      }
     }
 
     // Viewmodel da arma: sempre no mesmo lugar relativo à câmera (clássico
@@ -447,12 +487,24 @@ const fragmentShader = `
     // O offset forward precisa ser grande o bastante relativo ao tamanho do
     // modelo (~0.4-0.8 unidades) pra projeção (fwd*1.3 em main(), abaixo)
     // não estourar a arma pra fora da tela: com forward=0.55 (valor antigo)
-    // a arma ocupava praticamente a tela inteira. right/up escalam junto
-    // com forward pra manter o mesmo canto (inferior-direito) na projeção.
+    // a arma ocupava praticamente a tela inteira.
+    //
+    // right/up ficam pequenos de propósito (perto do centro-inferior, não
+    // no canto): o canto inferior-direito é onde o HUD (#rightPanels, a
+    // própria Forge usada pra equipar) sempre desenha por cima do canvas —
+    // um canto cheio de uniform recebia a arma renderizada corretamente,
+    // só que escondida atrás do painel. Centro-inferior nunca tem HUD por
+    // cima em nenhum tamanho de janela.
     vec3 camFwd=normalize(u_cameraDir);
     vec3 camRight=normalize(cross(vec3(0,1,0),camFwd));
     vec3 camUp=cross(camFwd,camRight);
-    vec3 wOff=p-(u_cameraPosition+camFwd*2.2+camRight*0.68-camUp*0.50);
+    // Animaçãozinha de ataque: um jab curto pra frente/cima que decai em
+    // ~0.28s a partir do instante do último golpe (u_attackTime) — mesmo
+    // SDF, sem branch por tipo de arma, só desloca onde ela fica.
+    float atkT=u_time-u_attackTime;
+    float swing=atkT>=0.0&&atkT<0.28?sin((atkT/0.28)*3.14159265):0.0;
+    vec3 wCenter=u_cameraPosition+camFwd*(2.2+swing*0.45)+camRight*0.08-camUp*(0.50-swing*0.16);
+    vec3 wOff=p-wCenter;
     vec3 wLocal=vec3(dot(wOff,camRight),dot(wOff,camUp),dot(wOff,camFwd));
     float weapon=weaponSDF(wLocal,u_weaponType);
 
@@ -1031,7 +1083,8 @@ function onServerMsg(d) {
       if (d.player_state) applyState(d.player_state);
       break;
     case 'DESTROYED':
-      triggerExplosion();
+      // Sem toast aqui de propósito: a própria estrutura afundando/encolhendo
+      // no shader (ver DESTROY_ANIM em map()) já É o feedback de "destruído".
       if (d.target_id) applyPersistedState(d.target_id, { status: 'destroyed' });
       if (d.player_state) applyState(d.player_state);
       break;
@@ -1132,6 +1185,12 @@ function shoot() {
   const oid = structureId(aimResult.cellCx, aimResult.cellCz);
   if (localModified.has(oid)) { showToast('Já destruído'); return; }
   lastShotTime = clock.elapsedTime;
+  // u_attackTime tem que vir do MESMO relógio que o shader usa (u_time), não
+  // de clock.elapsedTime: u_time avança com delta clampado (Math.min(...,0.05),
+  // ver loop()) e dessincroniza de clock.elapsedTime depois de qualquer soluço
+  // de frame — comparar os dois relógios diferentes fazia o swing nunca cair
+  // dentro da janela de 0..0.28s, ou cair tarde demais pra ser visível.
+  uniforms.u_attackTime.value = uniforms.u_time.value;
   sendAction({ action_type: 'SHOOT', target_id: oid, target_tags: ['destruivel', 'hostil'] });
 }
 
@@ -1155,7 +1214,6 @@ function tryLoot() {
 }
 
 // ─── Efeitos ────────────────────────────────────────────────
-function triggerExplosion() { showToast('💥 DESTRUÍDO'); }
 function triggerDamageFlash() {
   const f = document.getElementById('flash');
   f.style.opacity = '0.5';
