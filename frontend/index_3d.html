@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus: Unbound — Protótipo Three.js tradicional</title>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Courier New',monospace;color:#cfe}
+#gl{position:fixed;inset:0;display:block;width:100vw;height:100vh}
+#hud{position:fixed;top:12px;left:12px;z-index:10;font-size:11px;line-height:1.6;letter-spacing:1px;background:rgba(0,0,0,.5);padding:10px 14px;border:1px solid rgba(0,255,150,.3);border-radius:6px;backdrop-filter:blur(6px);pointer-events:none}
+#hud b{color:#7fff9f}
+#help{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:10;font-size:10px;opacity:.5;letter-spacing:2px;pointer-events:none;text-align:center}
+#xhair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9;width:6px;height:6px;border-radius:50%;background:#7fff9f;opacity:.7;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="xhair"></div>
+<div id="hud">
+  <div><b>NEXUS</b> · PROTÓTIPO THREE.JS TRADICIONAL</div>
+  <div>FPS <b id="fps">—</b></div>
+  <div>Pos <span id="posTxt">0, 0, 0</span></div>
+  <div>Hora <b id="clockTxt">09:00</b></div>
+  <div>Grama (instâncias) <b id="grassCount">0</b></div>
+</div>
+<div id="help">CLICK trava o mouse · WASD move · MOUSE olha · SHIFT corre · [ ] velocidade do dia · P pausa</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+
+/* ════════════════════════════════════════════════════════════
+   PROTÓTIPO — Three.js TRADICIONAL (malhas reais, sem SDF/ray
+   marching). Prova a nova fundação visual: terreno com relevo,
+   árvores/pedras como objetos 3D de verdade, grama densa via
+   InstancedMesh, player WASD+mouse andando sobre o terreno.
+
+   NÃO depende do backend (main.py) — mundo só local, sem
+   WebSocket. Multiplayer/inventário/forge ficam pra depois.
+   Não toca em frontend/index.html (SDF original preservado).
+   ════════════════════════════════════════════════════════════ */
+
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+// Cor real sincronizada por frame com o horizonte do céu (ver syncDayNight) —
+// sem scene.background: o dome procedural abaixo cobre 100% da view.
+scene.fog = new THREE.Fog(0x000000, 60, 220);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 500);
+
+// ─── Terreno: ruído 2D simples (value noise + fbm), MESMA função usada
+// pro deslocamento de vértice e pra física do player (heightAt) — fonte
+// única, mesmo princípio que já provou funcionar no motor SDF anterior.
+function hash(x, z) {
+  const s = Math.sin(x * 127.1 + z * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+function noise2(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  let fx = x - ix, fz = z - iz;
+  fx = fx * fx * (3 - 2 * fx);
+  fz = fz * fz * (3 - 2 * fz);
+  const a = hash(ix, iz), b = hash(ix + 1, iz);
+  const c = hash(ix, iz + 1), d = hash(ix + 1, iz + 1);
+  return (a + (b - a) * fx) + (c - a) * fz + (a - b - c + d) * fx * fz;
+}
+function fbm(x, z) {
+  let v = 0, a = 0.5;
+  for (let i = 0; i < 4; i++) {
+    v += a * noise2(x, z);
+    x *= 2.03; z *= 2.03;
+    a *= 0.5;
+  }
+  return v;
+}
+const TERRAIN_FREQ = 0.022, TERRAIN_AMP = 5.5;
+function heightAt(x, z) {
+  return fbm(x * TERRAIN_FREQ, z * TERRAIN_FREQ) * TERRAIN_AMP;
+}
+
+const TERRAIN_SIZE = 300, TERRAIN_SEG = 150;
+const terrainGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEG, TERRAIN_SEG);
+terrainGeo.rotateX(-Math.PI / 2); // deita no plano XZ; Y passa a ser "pra cima"
+{
+  const posAttr = terrainGeo.attributes.position;
+  const colors = new Float32Array(posAttr.count * 3);
+  const colorLow = new THREE.Color(0x35551f), colorHigh = new THREE.Color(0x8ab552);
+  const tmp = new THREE.Color();
+  for (let i = 0; i < posAttr.count; i++) {
+    const x = posAttr.getX(i), z = posAttr.getZ(i);
+    const h = heightAt(x, z);
+    posAttr.setY(i, h);
+    const t = THREE.MathUtils.clamp(h / TERRAIN_AMP * 0.5 + 0.5, 0, 1);
+    tmp.copy(colorLow).lerp(colorHigh, t);
+    colors[i * 3] = tmp.r; colors[i * 3 + 1] = tmp.g; colors[i * 3 + 2] = tmp.b;
+  }
+  terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  terrainGeo.computeVertexNormals();
+}
+const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1.0, metalness: 0.0 });
+const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+terrain.receiveShadow = true;
+scene.add(terrain);
+
+// ─── Iluminação: sol + lua (direcionais) + céu/chão (hemisfério) — cor,
+// intensidade e posição das 3 são recalculadas por frame em syncDayNight(),
+// a partir da MESMA direção de sol (ver "Céu procedural + ciclo dia/noite"
+// abaixo). Os valores aqui são só o estado inicial antes do 1º frame.
+const sun = new THREE.DirectionalLight(0xfff3d6, 1.4);
+sun.position.set(80, 120, 40);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -150; sun.shadow.camera.right = 150;
+sun.shadow.camera.top = 150; sun.shadow.camera.bottom = -150;
+sun.shadow.camera.near = 10; sun.shadow.camera.far = 300;
+sun.shadow.bias = -0.0015;
+scene.add(sun);
+
+// Luz de lua: preenchimento fraco e frio de noite. Nunca lança sombra — o
+// custo de um 2º shadow map não compensa pra uma luz tão tênue.
+const moonLight = new THREE.DirectionalLight(0x8fa8ff, 0.0);
+moonLight.castShadow = false;
+scene.add(moonLight);
+
+const hemiLight = new THREE.HemisphereLight(0xbfe3ff, 0x3a4a2a, 0.65);
+scene.add(hemiLight);
+
+// ─── Céu procedural + ciclo dia/noite ──────────────────────────────────
+// Dome gigante (BackSide, recentrado na câmera todo frame) com shader
+// próprio: gradiente zênite/horizonte, disco do sol com glow, lua, e um
+// campo de estrelas hasheado em coordenadas de FACE DE CUBO (não em
+// longitude/latitude esférica — evitaria a distorção/concentração clássica
+// no zênite de uma parametrização esférica simples). Zero textura, zero
+// asset externo — mesma convenção de "geração procedural" do motor SDF
+// anterior. A MESMA direção de sol alimenta o shader, a luz direcional do
+// sol/lua e o hemisfério: uma fonte única de "que hora é" pra tudo que
+// depende de luz (mesmo princípio de fonte única já usado no motor SDF).
+function sunDirFromHours(hours) {
+  const angle = (hours / 24 - 0.25) * Math.PI * 2;
+  return new THREE.Vector3(Math.cos(angle), Math.sin(angle), 0.35).normalize();
+}
+
+// Paleta por hora do dia — interpolada linearmente entre vizinhos em
+// sampleSky(). h=24 repete h=0 pra fechar o ciclo sem salto na virada da
+// meia-noite.
+const DAY_PALETTE = [
+  { h: 0,    zenith: 0x02030a, horizon: 0x0a0e1a, sun: 0x8fa8ff, amb: 0.12 },
+  { h: 5,    zenith: 0x0c1230, horizon: 0x2a2440, sun: 0x8fa8ff, amb: 0.14 },
+  { h: 6.5,  zenith: 0x3f6fae, horizon: 0xffb27a, sun: 0xffcf9e, amb: 0.35 },
+  { h: 9,    zenith: 0x4f9bdb, horizon: 0xcfe8f5, sun: 0xfff3d6, amb: 0.55 },
+  { h: 12,   zenith: 0x3f8fdb, horizon: 0xbfe0f2, sun: 0xffffff, amb: 0.65 },
+  { h: 16,   zenith: 0x4f9bdb, horizon: 0xcfe8f5, sun: 0xfff3d6, amb: 0.55 },
+  { h: 18.5, zenith: 0x3a3f7a, horizon: 0xff7a3c, sun: 0xff9a52, amb: 0.35 },
+  { h: 20,   zenith: 0x11163a, horizon: 0x4a2f4e, sun: 0x8fa8ff, amb: 0.18 },
+  { h: 22,   zenith: 0x05071a, horizon: 0x10142c, sun: 0x8fa8ff, amb: 0.13 },
+  { h: 24,   zenith: 0x02030a, horizon: 0x0a0e1a, sun: 0x8fa8ff, amb: 0.12 },
+];
+const _skyA = { zenith: new THREE.Color(), horizon: new THREE.Color(), sun: new THREE.Color() };
+const _skyB = { zenith: new THREE.Color(), horizon: new THREE.Color(), sun: new THREE.Color() };
+const skyOut = { zenith: new THREE.Color(), horizon: new THREE.Color(), sun: new THREE.Color(), amb: 0 };
+function sampleSky(hours) {
+  let i = 0;
+  while (i < DAY_PALETTE.length - 1 && DAY_PALETTE[i + 1].h <= hours) i++;
+  const a = DAY_PALETTE[i], b = DAY_PALETTE[Math.min(i + 1, DAY_PALETTE.length - 1)];
+  const span = b.h - a.h;
+  const t = span > 0 ? THREE.MathUtils.clamp((hours - a.h) / span, 0, 1) : 0;
+  _skyA.zenith.set(a.zenith); _skyB.zenith.set(b.zenith); skyOut.zenith.copy(_skyA.zenith).lerp(_skyB.zenith, t);
+  _skyA.horizon.set(a.horizon); _skyB.horizon.set(b.horizon); skyOut.horizon.copy(_skyA.horizon).lerp(_skyB.horizon, t);
+  _skyA.sun.set(a.sun); _skyB.sun.set(b.sun); skyOut.sun.copy(_skyA.sun).lerp(_skyB.sun, t);
+  skyOut.amb = THREE.MathUtils.lerp(a.amb, b.amb, t);
+  return skyOut;
+}
+function smoothstep(e0, e1, x) {
+  const t = THREE.MathUtils.clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+const skyGeo = new THREE.SphereGeometry(400, 32, 16);
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide,
+  depthWrite: false,
+  uniforms: {
+    uZenith: { value: new THREE.Color() },
+    uHorizon: { value: new THREE.Color() },
+    uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+    uSunColor: { value: new THREE.Color() },
+    uMoonDir: { value: new THREE.Vector3(0, -1, 0) },
+    uTime: { value: 0 },
+  },
+  vertexShader: `
+    varying vec3 vDir;
+    void main() {
+      // Esfera sem rotação, só translação pra seguir a câmera (ver
+      // skyDome.position em syncDayNight) — a direção em espaço local já É
+      // a direção em espaço de mundo, sem precisar de modelMatrix aqui.
+      vDir = position;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    varying vec3 vDir;
+    uniform vec3 uZenith;
+    uniform vec3 uHorizon;
+    uniform vec3 uSunDir;
+    uniform vec3 uSunColor;
+    uniform vec3 uMoonDir;
+    uniform float uTime;
+
+    float hash2(vec2 p) {
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    }
+
+    void main() {
+      vec3 dir = normalize(vDir);
+
+      float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+      vec3 col = mix(uHorizon, uZenith, pow(t, 0.55));
+
+      float sunDot = max(dot(dir, uSunDir), 0.0);
+      float sunDisc = smoothstep(0.9985, 0.9997, sunDot);
+      float sunGlow = pow(sunDot, 80.0) * 0.55;
+      col += uSunColor * (sunDisc * 3.0 + sunGlow);
+
+      float moonVisible = smoothstep(0.0, 0.06, uMoonDir.y);
+      float moonDot = max(dot(dir, uMoonDir), 0.0);
+      float moonDisc = smoothstep(0.9990, 0.9998, moonDot) * moonVisible;
+      col += vec3(0.82, 0.88, 1.0) * moonDisc * 1.4;
+
+      // Estrelas: hash por face de cubo (não por longitude/latitude), pra
+      // não distorcer/concentrar perto do zênite.
+      float nightFactor = smoothstep(0.05, -0.05, uSunDir.y);
+      if (nightFactor > 0.001) {
+        vec3 ad = abs(dir);
+        vec2 uv; float faceId;
+        if (ad.x >= ad.y && ad.x >= ad.z)      { uv = dir.yz / ad.x; faceId = 0.0; }
+        else if (ad.y >= ad.z)                  { uv = dir.xz / ad.y; faceId = 1.0; }
+        else                                     { uv = dir.xy / ad.z; faceId = 2.0; }
+        vec2 cell = floor(uv * 90.0) + faceId * 271.0;
+        float starHash = hash2(cell);
+        float present = step(0.9965, starHash);
+        float brightness = mix(0.35, 1.0, fract(starHash * 97.13));
+        float twinkle = 0.7 + 0.3 * sin(uTime * 3.0 + starHash * 123.0);
+        col += vec3(present * brightness * twinkle * nightFactor);
+      }
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+});
+const skyDome = new THREE.Mesh(skyGeo, skyMat);
+scene.add(skyDome);
+
+// Controle do ciclo: `speed` em horas-de-jogo por segundo real — padrão
+// fecha um dia completo em 3min, suficiente pra ver o ciclo inteiro num
+// teste curto sem ficar instantâneo. '[' / ']' ajustam, 'P' pausa.
+const HEMI_DAY_GROUND = new THREE.Color(0x3a4a2a);
+const HEMI_NIGHT_GROUND = new THREE.Color(0x05060a);
+const dayState = { hours: 9.0, speed: 24 / 180, paused: false };
+addEventListener('keydown', e => {
+  if (e.code === 'BracketLeft') dayState.speed = Math.max(0.02, dayState.speed * 0.5);
+  else if (e.code === 'BracketRight') dayState.speed = Math.min(50, dayState.speed * 2);
+  else if (e.code === 'KeyP') dayState.paused = !dayState.paused;
+});
+
+function syncDayNight(dt) {
+  if (!dayState.paused) {
+    dayState.hours = (dayState.hours + dayState.speed * dt) % 24;
+    if (dayState.hours < 0) dayState.hours += 24;
+  }
+  const sunDir = sunDirFromHours(dayState.hours);
+  const moonDir = sunDir.clone().multiplyScalar(-1);
+  const sky = sampleSky(dayState.hours);
+
+  skyDome.position.copy(camera.position); // sempre centrado na câmera, nunca "fica atrás"
+  skyMat.uniforms.uZenith.value.copy(sky.zenith);
+  skyMat.uniforms.uHorizon.value.copy(sky.horizon);
+  skyMat.uniforms.uSunDir.value.copy(sunDir);
+  skyMat.uniforms.uSunColor.value.copy(sky.sun);
+  skyMat.uniforms.uMoonDir.value.copy(moonDir);
+  skyMat.uniforms.uTime.value = clock.elapsedTime;
+
+  const sunStrength = smoothstep(-0.02, 0.25, sunDir.y);
+  sun.position.copy(sunDir).multiplyScalar(150);
+  sun.color.copy(sky.sun);
+  sun.intensity = sunStrength * 1.4;
+
+  const moonStrength = smoothstep(0.02, -0.25, sunDir.y);
+  moonLight.position.copy(moonDir).multiplyScalar(150);
+  moonLight.intensity = moonStrength * 0.18;
+
+  hemiLight.color.copy(sky.zenith);
+  hemiLight.groundColor.copy(HEMI_NIGHT_GROUND).lerp(HEMI_DAY_GROUND, sunStrength);
+  hemiLight.intensity = THREE.MathUtils.lerp(0.18, 0.7, sky.amb);
+
+  scene.fog.color.copy(sky.horizon);
+
+  const hh = Math.floor(dayState.hours).toString().padStart(2, '0');
+  const mm = Math.floor((dayState.hours % 1) * 60).toString().padStart(2, '0');
+  document.getElementById('clockTxt').textContent =
+    `${hh}:${mm} (${dayState.paused ? 'pausado' : dayState.speed.toFixed(2) + 'h/s'})`;
+}
+
+// ─── Árvores e pedras: malhas geradas por código (tronco=cilindro,
+// copa=cone, pedra=icosaedro com vértices deslocados) — objetos 3D DE
+// VERDADE na cena, não pintura de shader. Sem download de asset externo
+// (consistente com a convenção do projeto: geração procedural preferível
+// a assets externos), zero dependência de rede/licença.
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6b4a2f, roughness: 0.95 });
+const canopyMat = new THREE.MeshStandardMaterial({ color: 0x2d5a27, roughness: 0.9 });
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x8a8a86, roughness: 0.95 });
+
+function createTree() {
+  const g = new THREE.Group();
+  const trunkH = 1.6 + Math.random() * 1.4;
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.18, trunkH, 6), trunkMat);
+  trunk.position.y = trunkH / 2;
+  trunk.castShadow = true; trunk.receiveShadow = true;
+  g.add(trunk);
+  const canopyH = 1.6 + Math.random() * 1.2;
+  const canopyR = 0.9 + Math.random() * 0.5;
+  const canopy = new THREE.Mesh(new THREE.ConeGeometry(canopyR, canopyH, 7), canopyMat);
+  canopy.position.y = trunkH + canopyH * 0.42;
+  canopy.castShadow = true; canopy.receiveShadow = true;
+  g.add(canopy);
+  return g;
+}
+function createRock() {
+  const geo = new THREE.IcosahedronGeometry(0.4 + Math.random() * 0.5, 0);
+  const pos = geo.attributes.position;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i);
+    v.multiplyScalar(1 + (Math.random() - 0.5) * 0.35);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  }
+  geo.computeVertexNormals();
+  const m = new THREE.Mesh(geo, rockMat);
+  m.castShadow = true; m.receiveShadow = true;
+  m.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+  return m;
+}
+
+const SCATTER_RADIUS = 130;
+function randomScatterXZ(minDistFromCenter) {
+  let x, z, d2;
+  do {
+    x = (Math.random() * 2 - 1) * SCATTER_RADIUS;
+    z = (Math.random() * 2 - 1) * SCATTER_RADIUS;
+    d2 = x * x + z * z;
+  } while (d2 < minDistFromCenter * minDistFromCenter);
+  return [x, z];
+}
+
+const N_TREES = 45, N_ROCKS = 28;
+for (let i = 0; i < N_TREES; i++) {
+  const [x, z] = randomScatterXZ(8);
+  const tree = createTree();
+  tree.position.set(x, heightAt(x, z), z);
+  tree.scale.setScalar(0.85 + Math.random() * 0.5);
+  scene.add(tree);
+}
+for (let i = 0; i < N_ROCKS; i++) {
+  const [x, z] = randomScatterXZ(5);
+  const rock = createRock();
+  rock.position.set(x, heightAt(x, z) + 0.15, z);
+  scene.add(rock);
+}
+
+// ─── Grama densa via InstancedMesh — o teste-chave de performance: o
+// motor SDF anterior não conseguia desenhar folha-por-folha sem matar o
+// FPS (geometria explícita por brilho custa caro no ray march); aqui é
+// só 1 triângulo fininho repetido em GPU via matriz de instância, custo
+// de draw-call único independente da contagem.
+const GRASS_COUNT = 30000;
+const GRASS_RADIUS = 70; // área central, mais densa que o resto do terreno
+{
+  // Altura/escala da 1ª tentativa (bh=0.45, escala até ~1.5×1.3) ficou
+  // ESPINHOSA — visto de verdade num screenshot (Playwright + servidor
+  // estático local, sem precisar do navegador do Arthur): a grama
+  // dominava quase a tela inteira, parecendo cerca de espinhos no
+  // horizonte em vez de tufo rasteiro. Corrigido: bh menor (tufo de
+  // verdade, não capim alto) e faixa de escala mais estreita — e cor em
+  // 2 tons (base mais escura, ponta mais clara, via vertex color) pra
+  // dar profundidade sem precisar de textura/alpha.
+  const bw = 0.045, bh = 0.22;
+  const bladeGeo = new THREE.BufferGeometry();
+  bladeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+    -bw, 0, 0,
+     bw, 0, 0,
+     0, bh, 0,
+  ]), 3));
+  const darkGreen = new THREE.Color(0x3f7a2c), lightGreen = new THREE.Color(0x8cc24a);
+  bladeGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array([
+    darkGreen.r, darkGreen.g, darkGreen.b,
+    darkGreen.r, darkGreen.g, darkGreen.b,
+    lightGreen.r, lightGreen.g, lightGreen.b,
+  ]), 3));
+  bladeGeo.computeVertexNormals();
+  const grassMat = new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 1.0, side: THREE.DoubleSide,
+  });
+  const grass = new THREE.InstancedMesh(bladeGeo, grassMat, GRASS_COUNT);
+  grass.castShadow = false; // grama não lança sombra — custo alto, ganho visual baixo
+  grass.receiveShadow = true;
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < GRASS_COUNT; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(Math.random()) * GRASS_RADIUS; // raiz: densidade uniforme por área, não concentrada no centro
+    const x = Math.cos(ang) * r, z = Math.sin(ang) * r;
+    dummy.position.set(x, heightAt(x, z), z);
+    dummy.rotation.y = Math.random() * Math.PI * 2;
+    const s = 0.6 + Math.random() * 0.5;
+    dummy.scale.set(s, s * (0.85 + Math.random() * 0.3), s);
+    dummy.updateMatrix();
+    grass.setMatrixAt(i, dummy.matrix);
+  }
+  grass.instanceMatrix.needsUpdate = true;
+  scene.add(grass);
+  document.getElementById('grassCount').textContent = GRASS_COUNT.toLocaleString('pt-BR');
+}
+
+// ─── Player: WASD + mouse (pointer lock), colisão simples = altura do
+// terreno (heightAt) na posição XZ — mesma função usada pro relevo, sem
+// segunda implementação pra divergir.
+const EYE_HEIGHT = 1.75;
+const player = { pos: new THREE.Vector3(0, 0, 0), yaw: 0, pitch: -0.2 };
+player.pos.y = heightAt(0, 0) + EYE_HEIGHT;
+
+const keys = {};
+let pointerLocked = false;
+addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keyup', e => { keys[e.code] = false; });
+function releaseAllKeys() { for (const k in keys) keys[k] = false; }
+addEventListener('blur', releaseAllKeys);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAllKeys(); });
+
+canvas.addEventListener('click', () => { if (!pointerLocked) canvas.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === canvas;
+});
+addEventListener('mousemove', e => {
+  if (!pointerLocked) return;
+  player.yaw -= e.movementX * 0.0025;
+  player.pitch -= e.movementY * 0.0025;
+  player.pitch = Math.max(-1.4, Math.min(1.4, player.pitch));
+});
+
+function getForward() {
+  return new THREE.Vector3(
+    Math.sin(player.yaw) * Math.cos(player.pitch),
+    Math.sin(player.pitch),
+    Math.cos(player.yaw) * Math.cos(player.pitch)
+  );
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ─── Loop ───────────────────────────────────────────────────
+const clock = new THREE.Clock();
+let fpsT = 0, fpsCount = 0;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  const speed = (keys['ShiftLeft'] ? 14 : 7) * dt;
+  const flat = new THREE.Vector3(Math.sin(player.yaw), 0, Math.cos(player.yaw));
+  const right = new THREE.Vector3(flat.z, 0, -flat.x);
+  if (keys['KeyW']) player.pos.addScaledVector(flat, speed);
+  if (keys['KeyS']) player.pos.addScaledVector(flat, -speed);
+  if (keys['KeyA']) player.pos.addScaledVector(right, -speed);
+  if (keys['KeyD']) player.pos.addScaledVector(right, speed);
+
+  player.pos.y = heightAt(player.pos.x, player.pos.z) + EYE_HEIGHT;
+  camera.position.copy(player.pos);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(player.pos.clone().add(getForward()));
+
+  syncDayNight(dt);
+
+  document.getElementById('posTxt').textContent =
+    `${player.pos.x.toFixed(1)}, ${player.pos.y.toFixed(1)}, ${player.pos.z.toFixed(1)}`;
+
+  fpsCount++; fpsT += dt;
+  if (fpsT >= 0.5) {
+    document.getElementById('fps').textContent = Math.round(fpsCount / fpsT);
+    fpsCount = 0; fpsT = 0;
+  }
+
+  renderer.render(scene, camera);
+}
+loop();
+</script>
+</body>
+</html>
