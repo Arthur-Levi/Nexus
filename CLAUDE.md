@@ -9,8 +9,8 @@ sem download de assets. Mistura estéticas de universos em tempo real na GPU.
   persistência de mundo em chunks (malha 2D de 16 unidades), resolução de interações em tempo real.
 - **Frontend** (`frontend/index.html`): Three.js autocontido. Todo o render acontece num
   fragment shader GLSL via Ray Marching. Terreno procedural (fBm 6 oitavas), texturização PBR
-  por inclinação/altitude, névoa atmosférica, 3 mundos com identidade própria (Fantasia
-  Sombria, Sci-Fi, Pós-Apocalíptico) com transição glitch.
+  por inclinação/altitude, névoa atmosférica, 4 mundos com identidade própria (Fantasia
+  Sombria, Sci-Fi, Pós-Apocalíptico, Campo Gramado) com transição glitch.
 
 ## Como rodar
 
@@ -33,16 +33,18 @@ Limitado a 80 steps com far clipping.
 `terrainColor`) não conhecem "Fantasia"/"Sci-Fi"/"Pós-Apocalíptico" — só leem uniforms:
 `u_terrainScale`, `u_peakHeight`, `u_ridgeAmount`, `u_craterAmount` (forma do terreno),
 `u_colorLow`/`u_colorHigh`/`u_colorSlope` (cor por altitude/inclinação), `u_fogColor`,
-`u_sunColor`, `u_metalness` (atmosfera/material) e `u_objectType` (qual família de forma o
-`objectSDF` desenha — só esse é discreto, já que não dá pra misturar continuamente uma forma
-geométrica). Os 3 mundos atuais são só 3 objetos JS com esses valores (`WORLD_PRESETS` em
+`u_sunColor`, `u_metalness` (atmosfera/material), `u_objectType` (qual família de forma o
+`objectSDF` desenha) e `u_biome` (qual ALGORITMO de textura `terrainColor` usa — rocha ou
+grama; ver Campo Gramado no Histórico) — esses dois últimos são os únicos discretos, já que
+não dá pra misturar continuamente uma forma geométrica ou um algoritmo de textura inteiro.
+Os 4 mundos atuais são só 4 objetos JS com esses valores (`WORLD_PRESETS` em
 `frontend/index.html`) — uma IA gerando esses mesmos campos a partir de um prompt já é
 suficiente pra criar um mundo novo, sem tocar no shader.
 
 Física e render leem os MESMOS parâmetros: `terrainHeightJS` em JS espelha `terrainHeight`
 do GLSL constante a constante (mesma ordem de operações, mesmas frequências) — é o mesmo
 cuidado que resolveu o bug de sincronia (ver "Histórico" abaixo), agora generalizado pra
-qualquer combinação de parâmetros, não só pros 3 mundos fixos.
+qualquer combinação de parâmetros, não só pros 4 mundos fixos.
 
 Transição entre mundos: o shader nunca mistura duas SDFs — quem anima é o JS, interpolando
 os PARÂMETROS (`lerpParams`) e subindo um único conjunto de uniforms por frame
@@ -178,9 +180,46 @@ WebSocket real (M4 — reconexão e robustez, ver Histórico).
 - Tempo de carregamento inicial aceitável
 
 **Qualidade visual** (refinamento, depois dos 4 passos)
-- Detalhe de superfície no SDF (bump procedural, multi-escala)
+- Detalhe de superfície no SDF (bump procedural, multi-escala) — ✅ feito, ver
+  "Terreno Fotorrealista" abaixo
 - Iluminação rica (ambient occlusion no ray march)
 - Transições entre mundos polidas
+
+### Terreno Fotorrealista (triplanar + bump analítico)
+
+Aparência do terreno (cor/sombreamento), sem tocar a forma física — `terrainHeight`
+(GLSL) e `terrainHeightJS` (JS) continuam intocados; só `terrainColor` e o bloco de
+luz de `main()` no fragment shader mudaram.
+
+- **Triplanar mapping**: `terrainDetail(p,n)` projeta um ruído de detalhe nos 3
+  planos do mundo (YZ/XZ/XY) e mistura pelo peso da normal (`triplanarWeights`,
+  `pow(abs(n),4)` normalizado) — uma parede vertical mostra a mesma escala de grão
+  que o chão, em vez de esticar um UV planar único ao longo da inclinação.
+- **Derivada ANALÍTICA, não diferença finita**: `noised2(x)` é a fórmula fechada do
+  gradiente da interpolação bicúbica de `noise2` (mesmo hash, `deriv = 6f(1-f) *
+  (k1+k3*u.outro_eixo)`) — zero amostras extras de ruído pra obter o gradiente. A
+  ARMADILHA que isso evita: amostrar `noise(p+ε)-noise(p-ε)` (diferença finita)
+  custaria 2-6x mais amostras de ruído por pixel só pra aproximar o que a derivada
+  fechada dá de graça com a mesma amostra que já calcula o valor.
+- **Bump é só de SOMBREAMENTO**: o gradiente do detalhe (projetado no plano
+  tangente à normal verdadeira) gera uma normal separada (`nOut`/`nShade`) usada
+  SÓ no diffuse/specular/fresnel/sky-ambient. A normal geométrica real (`n`, de
+  `calcNormal`) continua sendo a única usada no offset do raio de sombra
+  (`p+n*0.06`) — se o bump entrasse ali, ranhuras que não existem fisicamente
+  criariam auto-sombra falsa.
+- **PBR aproveitando o bump**: `u_metalness` (já existia, varia por mundo) agora
+  também controla a força do bump (`mix(0.20,0.035,metalness)` — rocha fosca sente
+  mais relevo, metal/molhado quase nada) e o expoente especular
+  (`mix(18.0,64.0,metalness)` — reflexo espalhado em micro-glints na rocha fosca,
+  concentrado e pontual no metal). Nenhum uniform novo, nenhuma mudança de
+  protocolo — reuso do que já existia por mundo.
+- **LOD por distância**: `FAR_DETAIL_DIST=80.0` — além disso, 1 amostra plana
+  (sem triplanar, sem derivada) substitui o cálculo completo, mesmo padrão já
+  usado por `softShadow` (corte em `d<60`). Terreno longe não compensa pagar 3x
+  amostras de ruído por pixel, e o esticamento de textura não é perceptível
+  àquela distância mesmo.
+- Medido (ver Histórico 2026-06-21): impacto de FPS desprezível (~4%, dentro do
+  ruído de medição) graças ao LOD + 2 oitavas apenas (vs. 6 do terreno).
 
 **Áudio procedural** (refinamento, depois dos 4 passos)
 - Som gerado pela mesma semente do mundo, sem arquivos WAV/MP3
@@ -204,10 +243,25 @@ WebSocket real (M4 — reconexão e robustez, ver Histórico).
 - Identidade de jogador (hoje é um id aleatório persistido no localStorage do
   navegador — sobrevive a reload, não sobrevive a troca de dispositivo/navegador)
 
+**Otimização de rede** (futuro, quando multiplayer escalar)
+- Empacotamento binário das posições com struct (Python) em vez de JSON —
+  economiza banda com muitos jogadores. Cliente lê o array binário direto.
+  Vale a pena só na escala; JSON serve bem para poucos jogadores.
+
 ### Dependente de pagamento da API (pausado)
 - Universos infinitos por texto livre (Claude API gera parâmetros do mundo)
 - NPCs com diálogo gerado, missões dinâmicas, narrativa viva
 - Forge de Itens por descrição livre
+
+### Ideias avaliadas e DESCARTADAS (não implementar — registro do porquê)
+- "IA reescreve e recompila shader GLSL em runtime (JIT)": recompilação trava
+  o frame (dezenas a centenas de ms, não é instantâneo) e shaders concatenados
+  por IA quebram fácil (tela preta por erro de sintaxe). A versão PARAMETRIZADA
+  já construída é mais robusta e quase tão flexível. Só compensaria para
+  mudanças estruturais que parâmetros não alcançam, com cache e cuidado.
+- "Smooth minimum para fundir jogadores como gotas de mercúrio": técnica real
+  de SDF, mas aplicação errada — jogadores devem ser corpos distintos, não
+  blobs que derretem ao se aproximar. Usar união simples (min), não smooth min.
 
 ### NÃO é engenharia (não confundir com tarefa de código)
 - Tração de usuários, marketing, streamers
@@ -429,6 +483,102 @@ WebSocket real (M4 — reconexão e robustez, ver Histórico).
   corrigido (baixa prioridade, cosmético): `EQUIP` de duas abas do mesmo jogador quase ao
   mesmo milissegundo pode deixar o estado em memória e o banco temporariamente divergentes
   sobre qual item está equipado, até a próxima ação. Nenhum bug novo confirmado.
+
+**2026-06-21 — Terreno Fotorrealista: triplanar + derivada analítica**
+- Feito: `terrainColor` ganhou triplanar mapping (`terrainDetail`/`triplanarWeights`) e
+  bump de sombreamento via derivada analítica (`noised2`) — ver seção "Terreno
+  Fotorrealista" acima para a técnica completa. Escopo ficou 100% dentro de
+  `terrainColor` + bloco de luz de `main()`; `terrainHeight`/`terrainHeightJS`/`map()`/
+  `calcNormal` ficaram byte-a-byte intocados (confirmado por diff filtrado por esses
+  nomes antes de considerar a tarefa pronta).
+- Não funcionou (achado real, pego antes de qualquer teste no navegador real): usei
+  crase (`` ` ``) dentro de um comentário GLSL pra citar a variável `n` — mas o
+  fragment shader inteiro é uma template string JS (`` const fragmentShader = `...` ``),
+  então essa crase fechava a string JS no meio do arquivo, quebrando o `<script>` inteiro
+  com `SyntaxError: Unexpected identifier 'n'`. Pego rodando `node --check` no `<script>`
+  extraído do HTML — uma verificação de sintaxe JS pura, sem precisar de navegador, que
+  vale a pena rodar sempre que se edita comentários dentro de uma template string GLSL.
+  Lição: nunca usar crase em comentário GLSL quando o shader mora numa template string JS.
+- Validado sem navegador: shader isolado compila e linka via `gl.compileShader`/
+  `gl.linkProgram` num contexto WebGL bare (Playwright, sem Three.js/jogo) — mesma técnica
+  de validação rápida já usada na sessão do viewmodel da arma.
+- Validado com navegador real (Playwright, apesar da contenção de CPU do ambiente — ver
+  abaixo): zero erros de console/`pageerror`; física intacta (offset `pos.y -
+  terrainHeightJS` ficou estável em ~2.5-2.6, batendo com `PLAYER_EYE_HEIGHT`, antes e
+  depois de andar — sem flutuar, sem atravessar); `physics.onGround=true`; multiplayer
+  (`u_remotePlayerCount` contou o bot); Forge+Equip (forjar lança, equipar, `u_weaponType`
+  foi a 2 — só levou ~2s pra chegar via rede, não é regressão, é latência do ambiente);
+  raycast/`shoot()` recusou tiro sem alvo válido ("Sem alvo"), comportamento correto.
+- FPS antes/depois: medido via `git stash`/`git stash pop` (código antigo vs novo) na
+  MESMA sessão de navegador pra eliminar variância entre processos diferentes — 23 FPS
+  (antes) → 22 FPS (depois), ~4%, dentro do ruído de medição. Números absolutos são baixos
+  porque é renderização via SwiftShader (software) num sandbox sob carga (load average
+  1.5-3.4 num 2-núcleos, mesma contenção de `npm install` documentada em sessões
+  anteriores) — não comparável a FPS de GPU real, mas válido como comparação relativa
+  antes/depois nas MESMAS condições. Resultado consistente com o LOD (`d<80`) e o uso de
+  só 2 oitavas de detalhe (vs. 6 do terreno) terem mantido o custo baixo, como esperado.
+- Feedback do Arthur testando de verdade: "não vi diferença visual nenhuma". Causa real
+  (não só achismo): frequência do detalhe alta demais (`freq=1.4`, período ~32cm — ruído
+  fino sem coerência visual a distância de jogo) e a variação de COR só aparecia em
+  ladeira (`smoothstep(slope)`) — no chão plano, onde ele estava andando, só existia o
+  bump de luz, sutil demais sozinho. Corrigido: `freq` baixou pra `0.5` (blobs ~90cm, escala
+  de "pedra"), `bumpStrength` subiu de `0.20`→`0.32`, e um speckle de albedo NOVO
+  (`col*=mix(0.92,1.08,grain)`) passou a aplicar em TODO terreno, não só em ladeira.
+
+**2026-06-21 — Passe visual: Ambient Occlusion + pós-processamento + paleta + céu**
+- Feito: `calcAO` (5 amostras de `map()` ao longo da normal real, técnica IQ) escurecendo
+  só a luz ambiente (nunca a luz direta, que já tem `softShadow`); pipeline de pós-
+  processamento manual em 3 passadas SEM libs novas (cena → RT HDR linear `HalfFloatType`
+  → bloom extrai+desfoca claros em meia-res → composição final soma+tonemap ACES
+  (Narkowicz)+vinheta+contraste/saturação+gamma); paleta dos 3 mundos ajustada pra sombra
+  fria/luz quente; céu ganhou banda de neblina morna no horizonte antes do gradiente pro
+  zênite. Gamma saiu do shader principal (agora escreve HDR linear) e foi pra última
+  passada, depois do bloom somado — só ali o HDR pode ser comprimido sem perder o que tava
+  "queimado" (disco solar, specular forte).
+- Não funcionou inicialmente (achado na varredura de bugs pedida pelo Arthur antes do
+  teste de 30min, ver abaixo): `resizePostTargets()` fazia `dispose()`+`new
+  WebGLRenderTarget` a cada disparo da resolução adaptativa (que pode rodar a cada ~0.5s
+  enquanto ajusta) — realocava textura GPU repetidamente até estabilizar. Corrigido pra
+  usar `sceneRT.setSize()`/`bloomRT.setSize()` (redimensiona o framebuffer existente) só
+  recriando o RT na primeira vez.
+- Validado: os 3 pares de shader (cena/bloom/composição) compilam e linkam isolados via
+  WebGL bare; diff filtrado por `terrainHeight`/`terrainHeightJS`/`map`/`calcNormal`/
+  raycast/colisão deu zero linhas tocadas (só comentário pré-existente cita o nome) — física
+  e raycast intocados por construção, não só por inspeção visual.
+- Teste de estresse de 30min (`tools` temporário em `/tmp`, não no repo — script
+  descartável de QA): 4 conexões WebSocket reais fazendo MOVE/SHOOT/FORGE/EQUIP/
+  INTERACT/PING/SET_STYLE em loop contra o servidor já no ar, health-check a cada 30s,
+  amostragem de memória a cada 60s. Zero erros/desconexões anormais, memória do processo
+  do servidor subindo muito devagar (~56,7MB→57,3MB em ~7min de amostra) — sem sinal de
+  leak. `watchfiles` loga "changes detected" com frequência alta (provavelmente escritas do
+  SQLite) mas confirmado que o processo do servidor NUNCA reiniciou de verdade (mesmo PID
+  desde o boot) — ruído de log, não bug funcional.
+- Aprovação humana: pendente (Arthur ainda vai testar o passe de AO/bloom/paleta/céu).
+
+**2026-06-21 — 4º mundo "Campo Gramado" (referência de qualidade visual)**
+- Feito: novo preset em `WORLD_PRESETS[3]` — colinas baixas/suaves via números (não código
+  novo): `peakHeight:4.5`, `ridgeAmount:0.05` (sem cume afiado), `terrainScale:0.011`
+  (ondulação mais larga/aberta que os outros 3) — `terrainHeight`/`terrainHeightJS` ficaram
+  intocados, física sincronizada por construção (mesma função, números novos só).
+  `main.py` ampliado para aceitar `world_style` 0-3 (era 0-2) — sem isso o servidor
+  rejeitava `SET_STYLE` pro mundo novo com `ERROR`.
+- Decisão de arquitetura: novo uniform discreto `u_biome` (0=rocha, 1=grama) em
+  `terrainColor` — mesma categoria de exceção já aceita pra `u_objectType` (grama e rocha
+  são ALGORITMOS de textura diferentes, não cores pra interpolar continuamente). Sendo
+  uniform (mesmo valor em todo pixel do draw call), a branch de grama não custa nada extra
+  pros outros 3 mundos (GPU não diverge por uniform).
+- Textura de grama 100% a partir de ruído que já existia (zero função nova pesada): o
+  `grain` triplanar (já calculado pro bump) virou variação de tom verde-claro/escuro
+  ("lâminas"); `colorSlope` (sem uso no branch de grama até então) passa a revelar
+  terra/pedra em ladeira íngreme; manchas de terra exposta e flores (3 cores, escolhidas
+  por `hash2` na célula do ruído) são cada uma 1 `noise2` de baixa frequência adicional.
+  AO, sombra fria/luz quente e bloom/tonemap são genéricos — herdados de graça.
+  Nuvens simples (3 oitavas de `noise2` num plano horizontal projetado, concentradas perto
+  do horizonte) só ativam com `u_biome>0.5`, mesma lógica de custo-zero-pros-outros-mundos.
+- Validado sem navegador: shader compila/linka isolado via WebGL bare; `node --check` no
+  `<script>` extraído sem erro.
+- Aprovação humana: pendente (Arthur vai testar o Campo Gramado como cenário de
+  referência de qualidade visual).
 
 ## Histórico — bug de sincronia física/render (RESOLVIDO)
 

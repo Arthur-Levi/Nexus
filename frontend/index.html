@@ -80,6 +80,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Co
       <option value="0">🜂 Fantasia Sombria</option>
       <option value="1">⬡ Sci-Fi</option>
       <option value="2">☢ Pós-Apocalíptico</option>
+      <option value="3">🌾 Campo Gramado</option>
     </select>
     <button id="fuseBtn">⚡ FUNDIR UNIVERSO</button>
     <div id="styleInfo">Cada mundo tem terreno, atmosfera e estruturas próprias. A costura acontece na GPU em menos de 1 segundo.</div>
@@ -168,9 +169,20 @@ const uniforms = {
   u_colorHigh:    { value: new THREE.Vector3(0.92, 0.93, 0.97) },
   u_colorSlope:   { value: new THREE.Vector3(0.32, 0.28, 0.24) },
   u_fogColor:     { value: new THREE.Vector3(0.10, 0.07, 0.16) },
+  // Densidade da névoa exponencial (ver fog=1-exp(-d*d*u_fogDensity) em
+  // main()) — era uma constante FIXA (0.00018) compartilhada por todos os
+  // mundos, tunada pra atmosferas densas/moodily. Num campo aberto isso
+  // lavava o terreno pra cinza-azulado já a ~50-80 unidades (medido:
+  // fog=0.36 em d=50, fog=0.68 em d=80) — não dava "sensação de campo
+  // aberto", dava névoa pesada. Agora cada mundo escolhe o próprio alcance.
+  u_fogDensity:   { value: 0.00018 },
   u_sunColor:     { value: new THREE.Vector3(1.0, 0.92, 0.78) },
   u_metalness:    { value: 0.25 },
   u_objectType:   { value: 0.0 },
+  // Discreto, igual a u_objectType — grama e rocha são ALGORITMOS de
+  // textura diferentes em terrainColor (não só cores), então não cabe
+  // forçar num único caminho parametrizado continuamente. 0=rocha, 1=grama.
+  u_biome:        { value: 0.0 },
   // Arma equipada (viewmodel) — eixo independente do mundo/objeto, por
   // isso fora de WORLD_PRESETS. 0 = espada (padrão antes de forjar nada).
   u_weaponType:   { value: 0.0 },
@@ -235,19 +247,43 @@ function markCellDestroyed(cx, cz) {
 // são lidos pela física (terrainHeightJS) — ver lerpParams/lerp abaixo.
 const WORLD_PRESETS = [
   { // 0 — Fantasia Sombria: montanhas escarpadas, picos góticos
+    // Sombra (colorLow/colorSlope) puxada pro frio (verde-azulado), luz do
+    // sol já quente (sunColor) — mais profundidade que um único tom terroso.
     terrainScale: 0.016, peakHeight: 30, ridgeAmount: 0.9, craterAmount: 0,
-    colorLow: [0.20, 0.32, 0.12], colorHigh: [0.92, 0.93, 0.97], colorSlope: [0.32, 0.28, 0.24],
-    fogColor: [0.10, 0.07, 0.16], sunColor: [1.0, 0.92, 0.78], metalness: 0.25, objectType: 0,
+    colorLow: [0.15, 0.26, 0.16], colorHigh: [0.92, 0.93, 0.97], colorSlope: [0.27, 0.23, 0.27],
+    fogColor: [0.10, 0.07, 0.16], fogDensity: 0.00018, sunColor: [1.0, 0.92, 0.78], metalness: 0.25, objectType: 0, biome: 0,
   },
   { // 1 — Sci-Fi: terreno mais contido e liso, metal brilhante
+    // colorSlope (rocha exposta) puxado pro azul-metálico frio em vez de
+    // marrom — combina mais com metalness alto deste mundo.
     terrainScale: 0.05, peakHeight: 6, ridgeAmount: 0.15, craterAmount: 0,
-    colorLow: [0.20, 0.45, 0.30], colorHigh: [0.85, 0.88, 0.92], colorSlope: [0.45, 0.40, 0.35],
-    fogColor: [0.16, 0.24, 0.34], sunColor: [1.0, 0.92, 0.78], metalness: 1.3, objectType: 1,
+    colorLow: [0.20, 0.45, 0.30], colorHigh: [0.85, 0.88, 0.92], colorSlope: [0.34, 0.40, 0.48],
+    fogColor: [0.16, 0.24, 0.34], fogDensity: 0.00018, sunColor: [1.0, 0.92, 0.78], metalness: 1.3, objectType: 1, biome: 0,
   },
   { // 2 — Pós-Apocalíptico: dunas baixas tomadas de crateras
+    // colorHigh mais saturado/quente (laranja-magenta) contra colorLow mais
+    // escuro — contraste maior sem perder a identidade alienígena (sunColor magenta).
     terrainScale: 0.022, peakHeight: 5, ridgeAmount: 0.25, craterAmount: 7,
-    colorLow: [0.08, 0.0, 0.16], colorHigh: [0.6, 0.0, 0.7], colorSlope: [0.30, 0.15, 0.10],
-    fogColor: [0.34, 0.26, 0.16], sunColor: [1.0, 0.3, 0.9], metalness: 0.15, objectType: 2,
+    colorLow: [0.05, 0.0, 0.12], colorHigh: [0.75, 0.10, 0.55], colorSlope: [0.30, 0.15, 0.10],
+    fogColor: [0.34, 0.26, 0.16], fogDensity: 0.00018, sunColor: [1.0, 0.3, 0.9], metalness: 0.15, objectType: 2, biome: 0,
+  },
+  { // 3 — Campo Gramado: colinas baixas e suaves, dia claro (mundo de
+    // referência visual — sem cume afiado, terreno mais aberto/largo que
+    // os outros 3). objectType:2 reaproveita a ruína (combina com "campo
+    // tomado por ruínas antigas"). biome:1 liga o caminho de grama em
+    // terrainColor (ver lá) — só essa flag muda o ALGORITMO de textura;
+    // a forma do terreno é só números, igual aos outros mundos.
+    terrainScale: 0.011, peakHeight: 4.5, ridgeAmount: 0.05, craterAmount: 0,
+    colorLow: [0.16, 0.32, 0.12], colorHigh: [0.42, 0.62, 0.22], colorSlope: [0.40, 0.32, 0.20],
+    // fogDensity bem mais baixo que os outros — campo aberto pede
+    // visibilidade longa (sensação de escala), não névoa pesada já a 50-80u.
+    // fogColor mais saturado que a tentativa anterior — o zênite do céu
+    // (branch de miss em main()) é literalmente `fogColor*0.5`: um
+    // fogColor pálido (cor antiga) virava cinza sem saturação ao ser
+    // reduzido à metade (lê como névoa branca, não céu azul). Um azul mais
+    // forte aqui dá zênite azul de verdade E ainda funciona como névoa
+    // suave/tingimento ambiente nas outras duas funções que o reusam.
+    fogColor: [0.35, 0.55, 0.85], fogDensity: 0.00004, sunColor: [1.0, 0.96, 0.82], metalness: 0.12, objectType: 2, biome: 1,
   },
 ];
 
@@ -263,10 +299,14 @@ function lerpParams(a, b, t) {
     colorHigh: lerpVec3(a.colorHigh, b.colorHigh, t),
     colorSlope: lerpVec3(a.colorSlope, b.colorSlope, t),
     fogColor: lerpVec3(a.fogColor, b.fogColor, t),
+    fogDensity: lerp(a.fogDensity, b.fogDensity),
     sunColor: lerpVec3(a.sunColor, b.sunColor, t),
     metalness: lerp(a.metalness, b.metalness),
     // forma do objeto não dá pra misturar continuamente — troca na metade da transição
     objectType: t < 0.5 ? a.objectType : b.objectType,
+    // biome é discreto pelo mesmo motivo (grama/rocha são ALGORITMOS
+    // diferentes em terrainColor, não cores pra interpolar).
+    biome: t < 0.5 ? a.biome : b.biome,
   };
 }
 function syncWorldUniforms(p) {
@@ -278,9 +318,11 @@ function syncWorldUniforms(p) {
   uniforms.u_colorHigh.value.set(...p.colorHigh);
   uniforms.u_colorSlope.value.set(...p.colorSlope);
   uniforms.u_fogColor.value.set(...p.fogColor);
+  uniforms.u_fogDensity.value = p.fogDensity;
   uniforms.u_sunColor.value.set(...p.sunColor);
   uniforms.u_metalness.value = p.metalness;
   uniforms.u_objectType.value = p.objectType;
+  uniforms.u_biome.value = p.biome;
 }
 
 const vertexShader = `
@@ -315,9 +357,11 @@ const fragmentShader = `
   uniform vec3  u_colorHigh;
   uniform vec3  u_colorSlope;
   uniform vec3  u_fogColor;
+  uniform float u_fogDensity;
   uniform vec3  u_sunColor;
   uniform float u_metalness;
   uniform float u_objectType;
+  uniform float u_biome;
   uniform float u_weaponType;
   uniform float u_attackTime;
   uniform vec3  u_remotePlayers[8];
@@ -335,6 +379,52 @@ const fragmentShader = `
     float a=hash2(i+vec2(0,0)), b=hash2(i+vec2(1,0));
     float c=hash2(i+vec2(0,1)), d=hash2(i+vec2(1,1));
     return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+  }
+
+  // Mesmo ruído de noise2, mas com a DERIVADA ANALÍTICA (fórmula fechada da
+  // derivada da interpolação bicúbica), não diferença finita — zero amostras
+  // extras de hash pra obter o gradiente. Retorna (valor, d/dx, d/dy).
+  vec3 noised2(vec2 x){
+    vec2 i=floor(x), f=fract(x);
+    vec2 u=f*f*(3.0-2.0*f);
+    vec2 du=6.0*f*(1.0-f);
+    float a=hash2(i+vec2(0,0)), b=hash2(i+vec2(1,0));
+    float c=hash2(i+vec2(0,1)), d=hash2(i+vec2(1,1));
+    float k0=a, k1=b-a, k2=c-a, k3=a-b-c+d;
+    float value=k0+k1*u.x+k2*u.y+k3*u.x*u.y;
+    vec2 deriv=vec2(du.x*(k1+k3*u.y), du.y*(k2+k3*u.x));
+    return vec3(value, deriv);
+  }
+
+  // Peso triplanar: quanto cada plano (YZ/XZ/XY) contribui pra textura numa
+  // superfície com normal n. pow() afia a transição perto das diagonais 45°.
+  vec3 triplanarWeights(vec3 n){
+    vec3 w=pow(abs(n), vec3(4.0));
+    return w/(w.x+w.y+w.z+1e-5);
+  }
+
+  // Detalhe de micro-relevo: 2 oitavas de noised2 projetadas nos 3 planos
+  // (triplanar) e misturadas pelo peso da normal — elimina o esticamento de
+  // textura em encostas/paredes íngremes que um único UV planar teria. O
+  // gradiente retornado (XYZ do mundo) só serve pra inclinar a normal de
+  // SOMBREAMENTO em terrainColor — a altura física continua vindo
+  // exclusivamente de terrainHeight/terrainHeightJS, nunca daqui.
+  vec4 terrainDetail(vec3 p, vec3 n){
+    vec3 w=triplanarWeights(n);
+    float val=0.0;
+    vec3 grad=vec3(0.0);
+    float amp=0.6, freq=0.5;
+    for(int o=0;o<2;o++){
+      vec3 nx=noised2(p.yz*freq); // projeção no plano YZ (normal ~X)
+      vec3 ny=noised2(p.xz*freq); // projeção no plano XZ (normal ~Y)
+      vec3 nz=noised2(p.xy*freq); // projeção no plano XY (normal ~Z)
+      val += amp*(nx.x*w.x + ny.x*w.y + nz.x*w.z);
+      grad.x += amp*freq*(ny.y*w.y + nz.y*w.z);
+      grad.y += amp*freq*(nx.y*w.x + nz.z*w.z);
+      grad.z += amp*freq*(nx.z*w.x + ny.z*w.y);
+      freq*=2.3; amp*=0.5;
+    }
+    return vec4(val, grad);
   }
   float noise(vec3 x){
     vec3 i=floor(x), f=fract(x);
@@ -586,15 +676,120 @@ const fragmentShader = `
     return clamp(res,0.0,1.0);
   }
 
+  // Ambient occlusion por ray marching (técnica IQ): 5 amostras de map() ao
+  // longo da normal GEOMÉTRICA real (n, nunca a normal com bump — mesma
+  // regra do offset de sombra) com raio crescente. Quanto mais "fechado" o
+  // espaço perto de p (fenda, canto, base de objeto), menor a distância
+  // livre encontrada em cada amostra, e mais escurece. Só afeta luz
+  // AMBIENTE (skyAmb/fresnel) — nunca a luz direta do sol, que já tem sua
+  // própria sombra (softShadow). Sem custo em superfícies longe (mesmo
+  // corte d<60 já usado por softShadow).
+  float calcAO(vec3 p, vec3 n){
+    float occ=0.0, sca=1.0;
+    for(int i=0;i<5;i++){
+      float h=0.01+0.13*float(i)/4.0;
+      float d=map(p+n*h);
+      occ+=(h-d)*sca;
+      sca*=0.6;
+    }
+    return clamp(1.0-2.2*occ,0.0,1.0);
+  }
+
+  // Distância além da qual o detalhe cai pra 1 amostra plana (sem triplanar,
+  // sem derivada) — mesmo espírito do cutoff de softShadow (d<60, ver
+  // main()): terreno longe não compensa pagar 3 amostras de ruído por pixel,
+  // e o esticamento de textura não é perceptível àquela distância mesmo.
+  const float FAR_DETAIL_DIST=80.0;
+
   // Cor do terreno — gradiente por altitude entre colorLow/colorHigh, com
   // colorSlope revelado nas inclinações (efeito "rocha exposta" genérico).
-  vec3 terrainColor(vec3 p, vec3 n, vec3 colorLow, vec3 colorHigh, vec3 colorSlope){
+  // O "grain" antigo (2 amostras de noise 3D sem peso de normal) é
+  // substituído por terrainDetail: triplanar, então uma parede vertical
+  // mostra a MESMA escala de detalhe que o chão, em vez de esticar um UV
+  // único ao longo da inclinação. O gradiente do detalhe (derivada
+  // ANALÍTICA — ver noised2, nunca diferença finita) sai em nOut: uma normal
+  // só de SOMBREAMENTO, com o detalhe entalhado nela — a normal geométrica
+  // n que entra aqui não é alterada, e continua sendo a única usada pelo
+  // raymarch/offset de sombra fora desta função. metalness (já varia por
+  // mundo via u_metalness) controla a força do bump: rocha fosca mostra mais
+  // rugosidade, superfície metálica/molhada fica mais lisa.
+  vec3 terrainColor(vec3 p, vec3 n, vec3 colorLow, vec3 colorHigh, vec3 colorSlope, float d, float metalness, float biome, out vec3 nOut){
     float alt=clamp(p.y*0.04+0.4,0.0,1.0);
     float slope=1.0-n.y;
-    float grain=noise(p*2.5)*0.5+noise(p*8.0)*0.25;
-    vec3 col=mix(colorLow,colorHigh,alt);
-    vec3 slopeCol=mix(colorSlope*0.65,colorSlope,grain);
-    col=mix(col,slopeCol,smoothstep(0.15,0.6,slope));
+
+    float detailVal; vec3 detailGrad;
+    if(d<FAR_DETAIL_DIST){
+      vec4 det=terrainDetail(p*2.2, n);
+      detailVal=det.x;
+      detailGrad=det.yzw;
+    } else {
+      vec3 single=noised2(p.xz*2.2);
+      detailVal=single.x;
+      detailGrad=vec3(single.y,0.0,single.z);
+    }
+
+    float grain=clamp(detailVal,0.0,1.0);
+    vec3 col;
+    if(biome<0.5){
+      // ── ROCHA (Fantasia/Sci-Fi/Pós-Apocalíptico) — inalterado ──
+      col=mix(colorLow,colorHigh,alt);
+      vec3 slopeCol=mix(colorSlope*0.65,colorSlope,grain);
+      col=mix(col,slopeCol,smoothstep(0.15,0.6,slope));
+    } else {
+      // ── GRAMA (Campo Gramado) — tudo a partir do ruído/uniforms que já
+      // existem, nenhuma amostra nova de hash além do grain já calculado
+      // acima pro bump. ──
+      col=mix(colorLow,colorHigh,alt); // escuro no vale, claro no topo da ondulação
+      vec3 grassDark=col*0.78;
+      vec3 grassLight=mix(col, vec3(0.62,0.58,0.22), 0.55); // realce puxa pro amarelo-seco
+      col=mix(grassDark, grassLight, grain); // "lâminas" via o mesmo grain triplanar
+
+      // Ladeira mais íngreme revela terra/pedra (reaproveita colorSlope,
+      // sem uso nesse branch até agora) — efeito de erosão de campo real.
+      col=mix(col, colorSlope, smoothstep(0.25,0.65,slope)*0.7);
+
+      // Manchas de terra exposta (trilha/área pisada): ruído de baixa
+      // frequência INDEPENDENTE da inclinação — diferente do reveal de
+      // ladeira acima, que é sempre em encosta.
+      // Limiares calibrados numericamente (replicando noise2 em Python, ver
+      // sessão de debug): 0.62-0.74 cobria ~30% da área de trilha — virava
+      // "campo todo marrom" em vez de caminho esparso. 0.80-0.92 cobre
+      // ~1.5-8.7% (faixa parcial→total), trilha de verdade, não mancha geral.
+      float dirtN=noise2(p.xz*0.05);
+      float dirtMask=smoothstep(0.80,0.92,dirtN);
+      col=mix(col, vec3(0.32,0.22,0.13), dirtMask*0.85);
+
+      // Flores: ruído de baixa frequência acha "onde" (patch), hash2 na
+      // mesma célula escolhe a COR do patch entre 3 — nunca em cima de
+      // terra exposta, mais raras em ladeira (smoothstep ascendente,
+      // depois invertido, pra nunca violar edge0<edge1 do GLSL).
+      // Limiar 0.65-0.80 (sessão anterior) media ~17% de área coberta e
+      // ~12% em cor SÓLIDA (replicado em Python, sem navegador) — virava
+      // manchas brancas/roxas grandes e estouradas, lendo como "nave" em
+      // vez de flor silvestre. Corrigido em 2 frentes: limiar mais estreito
+      // (0.82-0.95 → só ~3-4% de área, full bloom raríssimo) E o blend
+      // nunca passa de 0.55 (fator *0.55 no final) — mesmo no pico do ruído,
+      // sobra grama por baixo, parece tufo de flor, não bloco de cor pura.
+      float flowerN=noise2(p.xz*0.9+31.7);
+      float flowerMask=smoothstep(0.82,0.95,flowerN)*(1.0-dirtMask)*(1.0-smoothstep(0.15,0.5,slope))*0.55;
+      float colorPick=hash2(floor(p.xz*0.9));
+      vec3 flowerCol=colorPick<0.34?vec3(0.95,0.85,0.15):(colorPick<0.67?vec3(0.80,0.76,0.62):vec3(0.55,0.30,0.70));
+      col=mix(col, flowerCol, flowerMask);
+    }
+    // Speckle de albedo SEM gate de inclinação — diferente do slopeCol acima
+    // (que só revela rocha em ladeira), isso dá micro-contraste visível em
+    // qualquer superfície, inclusive chão plano (onde o bump de sombreamento
+    // por si só era sutil demais para notar a olho nu).
+    col*=mix(0.92,1.08,grain);
+
+    // Bump de sombreamento: projeta o gradiente no plano tangente à normal
+    // (remove a componente ao longo de n, que não faria nada visualmente) e
+    // inclina a normal de sombra nessa direção — a técnica clássica de
+    // perturbar a normal por um campo de ruído, sem nunca tocar a geometria.
+    float bumpStrength=mix(0.32,0.06,clamp(metalness,0.0,1.0));
+    vec3 tangentGrad=detailGrad-n*dot(detailGrad,n);
+    nOut=normalize(n-tangentGrad*bumpStrength);
+
     return col;
   }
 
@@ -623,42 +818,65 @@ const fragmentShader = `
     if(d<u_far){
       vec3 p=ro+rd*d;
       vec3 n=calcNormal(p);
-      vec3 albedo=terrainColor(p,n,u_colorLow,u_colorHigh,u_colorSlope);
+      vec3 nShade=n;
+      vec3 albedo=terrainColor(p,n,u_colorLow,u_colorHigh,u_colorSlope,d,u_metalness,u_biome,nShade);
       // Avatar de jogador remoto: albedo fixo (cor de marca) em vez do
       // gradiente de terreno — sem isso ficaria camuflado com o chão ao
       // redor. Mesma tolerância de convergência do rayMarch (ver lá), pra
       // "é isso que bateu?" usar o mesmo critério de "superfície" do resto
-      // do motor.
+      // do motor. Sem bump de terreno no avatar — fica com a normal real.
       if(remotePlayersSDF(p) < SURF_DIST*(1.0+d*0.05)){
         albedo=vec3(0.0,1.0,0.8);
+        nShade=n;
       }
 
-      float diff=clamp(dot(n,sunDir),0.0,1.0);
-      // Sombra só nos objetos próximos (longe não compensa o custo)
+      float diff=clamp(dot(nShade,sunDir),0.0,1.0);
+      // Sombra usa a normal GEOMÉTRICA real (n), nunca a de sombreamento com
+      // bump — o offset do raio de sombra precisa ficar na superfície de
+      // verdade, senão o bump criaria auto-sombra falsa em ranhuras que não
+      // existem fisicamente. Sombra só nos objetos próximos (longe não
+      // compensa o custo).
       float sh = (d < 60.0) ? softShadow(p+n*0.06,sunDir) : 1.0;
       diff*=sh;
+      // AO (mesmo corte de distância e mesmo offset pela normal real que a
+      // sombra usa) — escurece só a luz ambiente abaixo.
+      float ao = (d < 60.0) ? calcAO(p+n*0.06, n) : 1.0;
 
-      float sky=0.5+0.5*n.y;
-      vec3 skyAmb=mix(vec3(0.12,0.12,0.16),vec3(0.30,0.36,0.48),sky);
+      float sky=0.5+0.5*nShade.y;
+      vec3 skyAmbBase=mix(vec3(0.10,0.11,0.16),vec3(0.28,0.34,0.46),sky);
+      // Ambiente ganha um tingimento sutil da cor de névoa do mundo atual —
+      // dá variedade de tom por universo sem precisar de uniform novo (já
+      // reusa u_fogColor, que já varia por preset).
+      vec3 skyAmb=mix(skyAmbBase, fogColor*0.6, 0.22)*ao;
 
       vec3 viewDir=normalize(ro-p);
       vec3 halfDir=normalize(sunDir+viewDir);
-      float spec=pow(clamp(dot(n,halfDir),0.0,1.0),48.0);
+      // Expoente especular também varia com metalness: rocha fosca espalha
+      // o reflexo em micro-glints largos (expoente baixo), metal/molhado
+      // mantém o brilho concentrado e pontual (expoente alto) — usa a MESMA
+      // normal com bump, então a rugosidade aparece no highlight também.
+      float specExp=mix(18.0,64.0,clamp(u_metalness,0.0,1.0));
+      float spec=pow(clamp(dot(nShade,halfDir),0.0,1.0),specExp);
 
       col=albedo*(skyAmb+sunCol*diff*1.1);
       col+=sunCol*spec*u_metalness*sh;
 
-      float fres=pow(1.0-clamp(dot(n,viewDir),0.0,1.0),4.0);
-      col+=fogColor*fres*0.3;
+      float fres=pow(1.0-clamp(dot(nShade,viewDir),0.0,1.0),4.0);
+      col+=fogColor*fres*0.3*ao;
 
-      float fog=1.0-exp(-d*d*0.00018);
+      float fog=1.0-exp(-d*d*u_fogDensity);
       float sunAmount=clamp(dot(rd,sunDir),0.0,1.0);
       vec3 fogTinted=mix(fogColor,sunCol,pow(sunAmount,4.0)*0.5);
       col=mix(col,fogTinted,fog);
     } else {
       float grad=clamp(rd.y*0.5+0.5,0.0,1.0);
       vec3 skyTop=fogColor*0.5; // zênite genérico: escurece a cor da névoa
-      col=mix(fogColor,skyTop,pow(grad,0.8));
+      // Banda de neblina morna rente ao horizonte (mistura névoa+sol) antes
+      // de subir pro zênite — dá sensação de profundidade/escala no
+      // horizonte em vez de um gradiente de 2 cores só.
+      vec3 horizonBand=mix(fogColor, sunCol*0.5+fogColor*0.5, 0.45);
+      vec3 sky=mix(horizonBand, skyTop, smoothstep(0.04,0.5,grad));
+      col=mix(fogColor, sky, smoothstep(0.0,0.1,grad));
       float sun=clamp(dot(rd,sunDir),0.0,1.0);
       col+=sunCol*pow(sun,256.0)*2.0;
       col+=sunCol*pow(sun,8.0)*0.3;
@@ -668,19 +886,165 @@ const fragmentShader = `
         float st=step(0.9985,hash(floor(rd*60.0)));
         col+=vec3(st)*0.7;
       }
+      // Nuvens simples — só no Campo Gramado (u_biome é UNIFORM, mesmo
+      // valor em todo pixel do draw call, então esta branch não custa nada
+      // extra pros outros 3 mundos: a GPU nem diverge). Projeta a direção
+      // do raio num plano horizontal "no infinito" (rd.xz/rd.y) e usa 3
+      // oitavas de noise2 nesse plano como cobertura; concentrada perto do
+      // horizonte (cai com a altura do olhar) pra não dominar o zênite.
+      if(u_biome>0.5 && rd.y>0.02){
+        vec2 cloudUV=rd.xz/rd.y*0.6+vec2(u_time*0.01,0.0);
+        float c=0.0, ca=0.55, cf=1.0;
+        for(int i=0;i<3;i++){ c+=ca*noise2(cloudUV*cf); cf*=2.1; ca*=0.5; }
+        float coverage=smoothstep(0.55,0.78,c)*(1.0-smoothstep(0.05,0.5,rd.y));
+        col=mix(col, vec3(0.97,0.97,1.0), coverage*0.75);
+      }
     }
 
     if(glitch>0.001){
       col+=hash(vec3(gl_FragCoord.xy,u_time))*glitch*0.12;
     }
 
-    col=pow(col,vec3(0.4545));
+    // Sem gamma aqui: esta passada agora escreve cor LINEAR HDR (valores
+    // podem passar de 1.0, ex: disco solar) num render target de meia/alta
+    // precisão — bloom precisa do HDR intacto pra saber o que é "claro o
+    // bastante pra brilhar". Tonemap (ACES) + gamma ficam só na passada de
+    // composição final (ver compositeFragmentShader), depois do bloom somado.
     gl_FragColor=vec4(col,1.0);
   }
 `;
 
 const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader });
 scene.add(new THREE.Mesh(geometry, material));
+
+// ─── Pós-processamento: 3 passadas manuais, sem libs novas ──────
+// 1) cena (acima) renderiza num render target HDR linear (sem gamma — ver
+//    comentário no fim do fragmentShader) em vez de ir direto pro canvas.
+// 2) bloomScene extrai+desfoca os pixels claros (sol, neon, neve) de
+//    sceneRT, escrevendo num RT de meia resolução — mais barato que
+//    desfocar em resolução cheia, e o resultado já vai ser borrado mesmo.
+// 3) compositeScene soma cena+bloom, aplica tonemap ACES, vinheta e
+//    contraste/saturação, e só ENTÃO faz a correção de gamma — tudo isso
+//    precisa do HDR linear intacto, por isso só acontece aqui, por último.
+let sceneRT = null, bloomRT = null;
+function makeSceneRT(w, h) {
+  return new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat, type: THREE.HalfFloatType,
+    depthBuffer: false, stencilBuffer: false,
+  });
+}
+function resizePostTargets() {
+  const size = new THREE.Vector2();
+  renderer.getDrawingBufferSize(size);
+  const w = Math.max(1, Math.round(size.x)), h = Math.max(1, Math.round(size.y));
+  const bw = Math.max(1, Math.round(w / 2)), bh = Math.max(1, Math.round(h / 2));
+  // setSize() redimensiona o framebuffer existente em vez de dispose+criar
+  // um WebGLRenderTarget novo — sem isso, a resolução adaptativa (que pode
+  // disparar a cada ~0.5s enquanto ajusta) realoca textura GPU repetidamente
+  // até estabilizar, gerando engasgos evitáveis logo no início da sessão.
+  if (!sceneRT) {
+    sceneRT = makeSceneRT(w, h);
+    bloomRT = makeSceneRT(bw, bh);
+    bloomUniforms.u_sceneTex.value = sceneRT.texture;
+    compositeUniforms.u_sceneTex.value = sceneRT.texture;
+    compositeUniforms.u_bloomTex.value = bloomRT.texture;
+  } else {
+    sceneRT.setSize(w, h);
+    bloomRT.setSize(bw, bh);
+  }
+  bloomUniforms.u_sceneRes.value.set(w, h);
+  bloomUniforms.u_resolution.value.set(bw, bh);
+  compositeUniforms.u_resolution.value.set(w, h);
+}
+
+const postVertexShader = vertexShader; // mesmo quad fullscreen, sem UV (usa gl_FragCoord)
+
+const bloomUniforms = {
+  u_sceneTex: { value: null },
+  u_sceneRes: { value: new THREE.Vector2(1, 1) },
+  u_resolution: { value: new THREE.Vector2(1, 1) },
+  u_threshold: { value: 1.0 },
+};
+const bloomFragmentShader = `
+  precision highp float;
+  uniform sampler2D u_sceneTex;
+  uniform vec2 u_sceneRes;
+  uniform vec2 u_resolution;
+  uniform float u_threshold;
+  void main(){
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    vec2 texel = 1.5 / u_sceneRes;
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for(int dx=-1; dx<=1; dx++){
+      for(int dy=-1; dy<=1; dy++){
+        vec3 c = texture2D(u_sceneTex, uv + vec2(float(dx), float(dy)) * texel).rgb;
+        float lum = dot(c, vec3(0.299, 0.587, 0.114));
+        float keep = smoothstep(u_threshold, u_threshold + 0.5, lum);
+        sum += c * keep;
+        wsum += 1.0;
+      }
+    }
+    gl_FragColor = vec4(sum / wsum, 1.0);
+  }
+`;
+const bloomMaterial = new THREE.ShaderMaterial({ uniforms: bloomUniforms, vertexShader: postVertexShader, fragmentShader: bloomFragmentShader });
+const bloomScene = new THREE.Scene();
+bloomScene.add(new THREE.Mesh(geometry, bloomMaterial));
+
+const compositeUniforms = {
+  u_sceneTex: { value: null },
+  u_bloomTex: { value: null },
+  u_resolution: { value: new THREE.Vector2(1, 1) },
+  u_bloomStrength: { value: 0.55 },
+  u_saturation: { value: 1.12 },
+  u_contrast: { value: 1.05 },
+};
+const compositeFragmentShader = `
+  precision highp float;
+  uniform sampler2D u_sceneTex;
+  uniform sampler2D u_bloomTex;
+  uniform vec2 u_resolution;
+  uniform float u_bloomStrength;
+  uniform float u_saturation;
+  uniform float u_contrast;
+
+  // Aproximação de Narkowicz pro tonemap ACES filmic — comprime o HDR (que
+  // pode passar de 1.0, ex: disco do sol) pra 0..1 com a curva de resposta
+  // de filme em vez de um clamp seco, evitando "queimar" os realces.
+  vec3 acesFilm(vec3 x){
+    float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
+    return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+  }
+
+  void main(){
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    vec3 sceneCol = texture2D(u_sceneTex, uv).rgb;
+    vec3 bloomCol = texture2D(u_bloomTex, uv).rgb;
+    vec3 hdr = sceneCol + bloomCol * u_bloomStrength;
+
+    vec3 col = acesFilm(hdr);
+
+    // Saturação/contraste sutis — depois do tonemap, ainda em linear.
+    float lum = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(vec3(lum), col, u_saturation);
+    col = (col - 0.5) * u_contrast + 0.5;
+
+    // Vinheta sutil nas bordas (uv normalizado -1..1, independente de aspect).
+    vec2 cuv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    float vig = 1.0 - smoothstep(0.55, 1.15, length(cuv)) * 0.30;
+    col *= vig;
+
+    col = pow(clamp(col, 0.0, 1.0), vec3(1.0/2.2));
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+const compositeMaterial = new THREE.ShaderMaterial({ uniforms: compositeUniforms, vertexShader: postVertexShader, fragmentShader: compositeFragmentShader });
+const compositeScene = new THREE.Scene();
+compositeScene.add(new THREE.Mesh(geometry, compositeMaterial));
+
+resizePostTargets();
 
 // ─── FÍSICA: altura do terreno replicada em JS ──────────────
 // Espelha exatamente a função terrainHeight do shader, para o
@@ -1001,7 +1365,7 @@ function getForward() {
 // o que de fato anima é a interpolação dos PARÂMETROS (lerpParams), não
 // mais um índice lido pelo shader — ver loop() e syncWorldUniforms.
 const styleTransition = { active: false, t: 1.0, duration: 1.5 };
-const STYLE_NAMES = ['Fantasia Sombria', 'Sci-Fi', 'Pós-Apocalíptico'];
+const STYLE_NAMES = ['Fantasia Sombria', 'Sci-Fi', 'Pós-Apocalíptico', 'Campo Gramado'];
 let currentPresetIndex = 0;
 let prevParams = WORLD_PRESETS[0];
 let currParams = WORLD_PRESETS[0];
@@ -1364,6 +1728,11 @@ function adaptResolution(fps) {
   if (Math.abs(target - currentScale) > 0.01) {
     currentScale = Math.max(0.5, Math.min(target, 2.0));
     renderer.setPixelRatio(currentScale);
+    // setPixelRatio muda o tamanho real do buffer de desenho — os render
+    // targets de pós-processamento (tamanho fixo, setados em
+    // resizePostTargets) ficariam com resolução errada (esticando/cortando
+    // a imagem) se não acompanhassem.
+    resizePostTargets();
   }
 }
 
@@ -1510,12 +1879,20 @@ function loop() {
     fpsCount = 0; fpsT = 0;
   }
 
+  // 3 passadas (ver setup acima): cena HDR → bloom (extrai+desfoca claros,
+  // meia-res) → composição final (soma+tonemap ACES+vinheta+gamma, pro canvas).
+  renderer.setRenderTarget(sceneRT);
   renderer.render(scene, camera);
+  renderer.setRenderTarget(bloomRT);
+  renderer.render(bloomScene, camera);
+  renderer.setRenderTarget(null);
+  renderer.render(compositeScene, camera);
 }
 
 addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
   uniforms.u_resolution.value.set(innerWidth, innerHeight);
+  resizePostTargets();
 });
 
 connect();

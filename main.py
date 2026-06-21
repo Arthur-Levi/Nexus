@@ -182,8 +182,8 @@ class ActionPayload(BaseModel):
     @field_validator("world_style")
     @classmethod
     def valid_style(cls, v):
-        if v is not None and v not in (0, 1, 2):
-            raise ValueError("world_style deve ser 0, 1 ou 2")
+        if v is not None and v not in (0, 1, 2, 3):
+            raise ValueError("world_style deve ser 0, 1, 2 ou 3")
         return v
 
     @field_validator("position")
